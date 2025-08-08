@@ -1,0 +1,15 @@
+# services/rag/requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0
+torchvision==0.23.0
+transformers==4.43.3
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sentence-transformers==5.1.0
+qdrant-client==1.15.1
+PyPDF2==3.0.1
+python-docx==1.2.0
+python-multipart==0.0.20
+numpy==2.2.6
+psycopg2-binary==2.9.10
+redis==6.4.0

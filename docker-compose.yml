@@ -1,0 +1,249 @@
+# docker-compose.yml
+version: '3.8'
+
+x-gpu-service: &gpu-config
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-common-variables: &common-variables
+  PUID: ${PUID:-1000}
+  PGID: ${PGID:-1000}
+  TZ: ${TZ:-UTC}
+
+networks:
+  jarvis-network:
+    driver: bridge
+
+services:
+  # ============= Infrastructure Services =============
+  
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: jarvis-postgres
+    environment:
+      <<: *common-variables
+      POSTGRES_DB: ${POSTGRES_DB:-jarvis}
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - /mnt/appsdata/jarvis/postgres:/var/lib/postgresql/data
+      - /mnt/appsdata/jarvis/init-scripts:/docker-entrypoint-initdb.d:ro
+    networks:
+      - jarvis-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jarvis"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: jarvis-redis
+    environment:
+      <<: *common-variables
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - /mnt/appsdata/jarvis/redis:/data
+    networks:
+      - jarvis-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: jarvis-qdrant
+    environment:
+      <<: *common-variables
+    ports:
+      - "6333:6333"
+    volumes:
+      - /mnt/appsdata/jarvis/qdrant:/qdrant/storage
+      - /mnt/appsdata/jarvis/config/qdrant.yaml:/qdrant/config/production.yaml:ro
+    networks:
+      - jarvis-network
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: jarvis-ollama
+    <<: *gpu-config
+    environment:
+      <<: *common-variables
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_HOST: "0.0.0.0"
+      OLLAMA_MODELS: /models
+    ports:
+      - "11434:11434"
+    volumes:
+      - /mnt/appsdata/jarvis/models/ollama:/models
+      - /mnt/appsdata/jarvis/scripts:/scripts:ro
+    networks:
+      - jarvis-network
+    restart: unless-stopped
+
+  # ============= JARVIS Services =============
+  
+  llm-service:
+    image: felix971/jarvis-llm:latest
+    container_name: jarvis-llm
+    <<: *gpu-config
+    environment:
+      <<: *common-variables
+      OLLAMA_HOST: ollama
+      REDIS_HOST: redis
+      MODEL_NAME: ${LLM_MODEL:-mixtral:8x7b-instruct-v0.1-q4_K_M}
+      CUDA_VISIBLE_DEVICES: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+    ports:
+      - "8001:8001"
+    volumes:
+      - /mnt/appsdata/jarvis/shared:/shared
+      - /mnt/appsdata/jarvis/logs/llm:/logs
+    networks:
+      - jarvis-network
+    depends_on:
+      - ollama
+      - redis
+    restart: unless-stopped
+
+  rag-service:
+    image: felix971/jarvis-rag:latest
+    container_name: jarvis-rag
+    <<: *gpu-config
+    environment:
+      <<: *common-variables
+      QDRANT_HOST: qdrant
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
+      CUDA_VISIBLE_DEVICES: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      TRANSFORMERS_CACHE: /models/transformers
+    ports:
+      - "8002:8002"
+    volumes:
+      - /mnt/appsdata/jarvis/shared:/shared
+      - /mnt/appsdata/jarvis/documents:/documents
+      - /mnt/appsdata/jarvis/models/transformers:/models/transformers
+      - /mnt/appsdata/jarvis/logs/rag:/logs
+    networks:
+      - jarvis-network
+    depends_on:
+      - qdrant
+      - postgres
+    restart: unless-stopped
+
+  voice-service:
+    image: felix971/jarvis-voice:latest
+    container_name: jarvis-voice
+    <<: *gpu-config
+    environment:
+      <<: *common-variables
+      WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
+      TTS_MODEL: ${TTS_MODEL:-tts_models/en/ljspeech/tacotron2-DDC}
+      CUDA_VISIBLE_DEVICES: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      WHISPER_CACHE: /models/whisper
+      TTS_CACHE: /models/tts
+    ports:
+      - "8003:8003"
+    volumes:
+      - /mnt/appsdata/jarvis/models/whisper:/models/whisper
+      - /mnt/appsdata/jarvis/models/tts:/models/tts
+      - /mnt/appsdata/jarvis/shared:/shared
+      - /mnt/appsdata/jarvis/logs/voice:/logs
+    networks:
+      - jarvis-network
+    restart: unless-stopped
+
+  orchestrator:
+    image: felix971/jarvis-orchestrator:latest
+    container_name: jarvis-orchestrator
+    environment:
+      <<: *common-variables
+      LLM_SERVICE_URL: http://llm-service:8001
+      RAG_SERVICE_URL: http://rag-service:8002
+      VOICE_SERVICE_URL: http://voice-service:8003
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
+    ports:
+      - "8000:8000"
+    volumes:
+      - /mnt/appsdata/jarvis/shared:/shared
+      - /mnt/appsdata/jarvis/logs/orchestrator:/logs
+    networks:
+      - jarvis-network
+    depends_on:
+      - llm-service
+      - rag-service
+      - voice-service
+    restart: unless-stopped
+
+  web:
+    image: felix971/jarvis-web:latest
+    container_name: jarvis-web
+    environment:
+      <<: *common-variables
+    ports:
+      - "3000:80"
+    volumes:
+      - /mnt/appsdata/jarvis/logs/nginx:/var/log/nginx
+    networks:
+      - jarvis-network
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+
+  # ============= Monitoring =============
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: jarvis-prometheus
+    environment:
+      <<: *common-variables
+    ports:
+      - "9090:9090"
+    volumes:
+      - /mnt/appsdata/jarvis/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /mnt/appsdata/jarvis/prometheus:/prometheus
+    networks:
+      - jarvis-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: jarvis-grafana
+    environment:
+      <<: *common-variables
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: redis-datasource
+    ports:
+      - "3001:3000"
+    volumes:
+      - /mnt/appsdata/jarvis/grafana:/var/lib/grafana
+      - /mnt/appsdata/jarvis/config/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - jarvis-network
+    restart: unless-stopped

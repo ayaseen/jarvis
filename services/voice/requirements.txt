@@ -1,0 +1,15 @@
+# services/voice/requirements.txt
+# This line tells pip to find PyTorch/Torchaudio on the correct index for CUDA 12.9
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.8.0
+torchvision==0.23.0
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+openai-whisper==20240930
+coqui-tts==0.27.0
+numpy==2.2.6
+torchaudio==2.8.0
+soundfile==0.13.1
+python-multipart==0.0.20
+librosa==0.11.0
