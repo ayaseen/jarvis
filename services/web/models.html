@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS Model Manager</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        h1 {
+            font-size: 3em;
+            text-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
+            margin-bottom: 10px;
+        }
+        
+        .back-link {
+            display: inline-block;
+            color: #00d4ff;
+            text-decoration: none;
+            margin-bottom: 20px;
+            padding: 10px 20px;
+            border: 1px solid #00d4ff;
+            border-radius: 20px;
+            transition: all 0.3s;
+        }
+        
+        .back-link:hover {
+            background: rgba(0, 212, 255, 0.2);
+        }
+        
+        .status-bar {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .status-item {
+            text-align: center;
+            padding: 10px;
+        }
+        
+        .status-label {
+            color: #a0a0a0;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+        
+        .status-value {
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        
+        .status-good { color: #4ade80; }
+        .status-warning { color: #fbbf24; }
+        .status-bad { color: #f87171; }
+        
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+        
+        @media (max-width: 768px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 25px;
+            border: 1px solid rgba(0, 212, 255, 0.3);
+        }
+        
+        .card h2 {
+            margin-bottom: 20px;
+            color: #00d4ff;
+            font-size: 1.5em;
+        }
+        
+        .model-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .model-item {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: transform 0.2s;
+        }
+        
+        .model-item:hover {
+            transform: translateX(5px);
+            background: rgba(0, 0, 0, 0.4);
+        }
+        
+        .model-info {
+            flex: 1;
+        }
+        
+        .model-name {
+            font-size: 1.2em;
+            color: #00d4ff;
+            margin-bottom: 5px;
+        }
+        
+        .model-details {
+            color: #a0a0a0;
+            font-size: 0.9em;
+        }
+        
+        .model-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
+        button {
+            background: rgba(0, 212, 255, 0.2);
+            border: 2px solid #00d4ff;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 0.9em;
+        }
+        
+        button:hover:not(:disabled) {
+            background: rgba(0, 212, 255, 0.4);
+            transform: scale(1.05);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        button.danger {
+            border-color: #f87171;
+            background: rgba(248, 113, 113, 0.2);
+        }
+        
+        button.danger:hover:not(:disabled) {
+            background: rgba(248, 113, 113, 0.4);
+        }
+        
+        button.active {
+            background: rgba(52, 211, 153, 0.3);
+            border-color: #34d399;
+        }
+        
+        .available-models {
+            display: grid;
+            gap: 15px;
+        }
+        
+        .category {
+            margin-bottom: 20px;
+        }
+        
+        .category-title {
+            color: #fbbf24;
+            font-size: 1.1em;
+            margin-bottom: 10px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid rgba(251, 191, 36, 0.3);
+        }
+        
+        .pull-progress {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 10px;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 25px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d4ff, #0099cc);
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-weight: bold;
+        }
+        
+        .log-output {
+            background: #000;
+            color: #0f0;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            max-height: 150px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        
+        .spinner {
+            border: 3px solid rgba(0, 212, 255, 0.3);
+            border-top: 3px solid #00d4ff;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #a0a0a0;
+        }
+        
+        .command-hint {
+            background: rgba(0, 0, 0, 0.5);
+            border-left: 3px solid #fbbf24;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 0.9em;
+        }
+        
+        .refresh-btn {
+            float: right;
+            margin-top: -10px;
+        }
+        
+        .model-size-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.8em;
+            margin-left: 10px;
+        }
+        
+        .size-small { background: rgba(52, 211, 153, 0.3); }
+        .size-medium { background: rgba(251, 191, 36, 0.3); }
+        .size-large { background: rgba(248, 113, 113, 0.3); }
+        
+        .error-message {
+            background: rgba(248, 113, 113, 0.2);
+            border: 1px solid #f87171;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="/" class="back-link">← Back to JARVIS Chat</a>
+            <h1>🤖 JARVIS Model Manager</h1>
+        </div>
+        
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-label">Ollama Status</div>
+                <div class="status-value" id="ollamaStatus">
+                    <span class="status-warning">Checking...</span>
+                </div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Active Model</div>
+                <div class="status-value" id="activeModel">
+                    <span class="status-warning">Loading...</span>
+                </div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Total Models</div>
+                <div class="status-value" id="totalModels">0</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">GPU Status</div>
+                <div class="status-value" id="gpuStatus">
+                    <span class="status-good">✓ Enabled</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="main-grid">
+            <!-- Installed Models -->
+            <div class="card">
+                <h2>
+                    📦 Installed Models
+                    <button class="refresh-btn" onclick="loadInstalledModels()">🔄 Refresh</button>
+                </h2>
+                <div id="installedModels" class="model-list">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+            
+            <!-- Available Models -->
+            <div class="card">
+                <h2>🌐 Available Models</h2>
+                
+                <div class="available-models">
+                    <!-- Small Models -->
+                    <div class="category">
+                        <div class="category-title">🟢 Small Models (Fast, 1-4 GB)</div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">phi:latest</div>
+                                <div class="model-details">Microsoft's tiny but capable model • 1.6 GB</div>
+                            </div>
+                            <button onclick="pullModel('phi:latest')" id="btn-phi">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">tinyllama:latest</div>
+                                <div class="model-details">Compact chat model • 638 MB</div>
+                            </div>
+                            <button onclick="pullModel('tinyllama:latest')" id="btn-tinyllama">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">gemma:2b</div>
+                                <div class="model-details">Google's small model • 1.4 GB</div>
+                            </div>
+                            <button onclick="pullModel('gemma:2b')" id="btn-gemma2b">Install</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Medium Models -->
+                    <div class="category">
+                        <div class="category-title">🟡 Medium Models (Balanced, 4-8 GB)</div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">mistral:latest</div>
+                                <div class="model-details">Excellent quality, fast • 4.1 GB</div>
+                            </div>
+                            <button onclick="pullModel('mistral:latest')" id="btn-mistral">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">llama2:7b</div>
+                                <div class="model-details">Meta's general purpose • 3.8 GB</div>
+                            </div>
+                            <button onclick="pullModel('llama2:7b')" id="btn-llama2">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">neural-chat:7b</div>
+                                <div class="model-details">Intel's conversational AI • 4.1 GB</div>
+                            </div>
+                            <button onclick="pullModel('neural-chat:7b')" id="btn-neural">Install</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Large Models -->
+                    <div class="category">
+                        <div class="category-title">🔴 Large Models (Best Quality, 8+ GB)</div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">llama2:13b</div>
+                                <div class="model-details">Larger Llama model • 7.4 GB</div>
+                            </div>
+                            <button onclick="pullModel('llama2:13b')" id="btn-llama213b">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">mixtral:8x7b</div>
+                                <div class="model-details">MoE architecture, very capable • 26 GB</div>
+                            </div>
+                            <button onclick="pullModel('mixtral:8x7b')" id="btn-mixtral">Install</button>
+                        </div>
+                        <div class="model-item">
+                            <div class="model-info">
+                                <div class="model-name">solar:10.7b</div>
+                                <div class="model-details">Upstage's powerful model • 6.1 GB</div>
+                            </div>
+                            <button onclick="pullModel('solar:10.7b')" id="btn-solar">Install</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Pull Progress -->
+                <div id="pullProgress" class="pull-progress">
+                    <div id="pullStatus">Preparing download...</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressBar">0%</div>
+                    </div>
+                    <div class="log-output" id="pullLogs"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Command Hint -->
+        <div class="card">
+            <h2>💡 Manual Commands</h2>
+            <div class="command-hint">
+                # Install a model manually:<br>
+                docker exec jarvis-ollama ollama pull MODEL_NAME<br><br>
+                
+                # Set active model:<br>
+                1. Edit docker-compose.yml or .env file<br>
+                2. Set: MODEL_NAME=your_model_name<br>
+                3. Run: docker-compose restart llm-service<br><br>
+                
+                # List all models:<br>
+                docker exec jarvis-ollama ollama list<br><br>
+                
+                # Remove a model:<br>
+                docker exec jarvis-ollama ollama rm MODEL_NAME
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Use orchestrator API instead of direct Ollama connection
+        const API_BASE = 'http://' + window.location.hostname + ':8000/api/models';
+        let currentPullController = null;
+        let installedModelsList = [];
+        
+        // Check system status
+        async function checkSystemStatus() {
+            const statusEl = document.getElementById('ollamaStatus');
+            const activeModelEl = document.getElementById('activeModel');
+            
+            try {
+                const response = await fetch(API_BASE + '/status');
+                const data = await response.json();
+                
+                // Update Ollama status
+                if (data.ollama_healthy) {
+                    statusEl.innerHTML = '<span class="status-good">✓ Running</span>';
+                } else {
+                    statusEl.innerHTML = '<span class="status-bad">✗ Offline</span>';
+                }
+                
+                // Update active model
+                activeModelEl.innerHTML = `<span class="status-good">${data.active_model || 'None'}</span>`;
+                
+                // Update GPU status
+                document.getElementById('gpuStatus').innerHTML = 
+                    data.gpu_enabled ? '<span class="status-good">✓ Enabled</span>' : 
+                                      '<span class="status-warning">⚠ CPU Mode</span>';
+                
+                return data.ollama_healthy;
+                
+            } catch (error) {
+                console.error('Status check failed:', error);
+                statusEl.innerHTML = '<span class="status-bad">✗ Error</span>';
+                activeModelEl.innerHTML = '<span class="status-bad">Error</span>';
+                return false;
+            }
+        }
+        
+        // Load installed models
+        async function loadInstalledModels() {
+            const container = document.getElementById('installedModels');
+            container.innerHTML = '<div class="spinner"></div>';
+            
+            try {
+                const response = await fetch(API_BASE + '/tags');
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                installedModelsList = data.models || [];
+                document.getElementById('totalModels').textContent = installedModelsList.length;
+                
+                if (installedModelsList.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <p>No models installed yet.</p>
+                            <p>Install one from the available models →</p>
+                        </div>
+                    `;
+                } else {
+                    // Get active model from localStorage or environment
+                    const activeModelName = localStorage.getItem('activeModel') || installedModelsList[0].name;
+                    
+                    container.innerHTML = installedModelsList.map(model => {
+                        const size = (model.size / 1e9).toFixed(1);
+                        const isActive = model.name === activeModelName;
+                        const modified = new Date(model.modified).toLocaleDateString();
+                        
+                        // Determine size category
+                        let sizeClass = 'size-small';
+                        if (size > 8) sizeClass = 'size-large';
+                        else if (size > 4) sizeClass = 'size-medium';
+                        
+                        return `
+                            <div class="model-item">
+                                <div class="model-info">
+                                    <div class="model-name">
+                                        ${model.name}
+                                        <span class="model-size-badge ${sizeClass}">${size} GB</span>
+                                    </div>
+                                    <div class="model-details">
+                                        Modified: ${modified} • ID: ${model.digest.substring(0, 12)}
+                                    </div>
+                                </div>
+                                <div class="model-actions">
+                                    ${isActive ? 
+                                        '<button class="active" disabled>Active</button>' : 
+                                        `<button onclick="setActiveModel('${model.name}')">Set Active</button>`
+                                    }
+                                    <button class="danger" onclick="removeModel('${model.name}')">Remove</button>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+                
+                // Update install buttons
+                updateInstallButtons();
+                
+            } catch (error) {
+                console.error('Failed to load models:', error);
+                container.innerHTML = `
+                    <div class="error-message">
+                        <p><strong>Failed to load models</strong></p>
+                        <p>${error.message}</p>
+                        <p style="margin-top: 10px;">Make sure the orchestrator service is running with the model API endpoints.</p>
+                    </div>
+                `;
+            }
+        }
+        
+        // Update install buttons based on installed models
+        function updateInstallButtons() {
+            const modelNames = installedModelsList.map(m => m.name);
+            
+            // List of all available models and their button IDs
+            const availableModels = [
+                { name: 'phi:latest', btnId: 'btn-phi' },
+                { name: 'tinyllama:latest', btnId: 'btn-tinyllama' },
+                { name: 'gemma:2b', btnId: 'btn-gemma2b' },
+                { name: 'mistral:latest', btnId: 'btn-mistral' },
+                { name: 'llama2:7b', btnId: 'btn-llama2' },
+                { name: 'neural-chat:7b', btnId: 'btn-neural' },
+                { name: 'llama2:13b', btnId: 'btn-llama213b' },
+                { name: 'mixtral:8x7b', btnId: 'btn-mixtral' },
+                { name: 'solar:10.7b', btnId: 'btn-solar' }
+            ];
+            
+            availableModels.forEach(model => {
+                const btn = document.getElementById(model.btnId);
+                if (btn) {
+                    if (modelNames.includes(model.name)) {
+                        btn.textContent = 'Installed';
+                        btn.disabled = true;
+                    } else {
+                        btn.textContent = 'Install';
+                        btn.disabled = false;
+                    }
+                }
+            });
+        }
+        
+        // Pull a model
+        async function pullModel(modelName) {
+            const progressDiv = document.getElementById('pullProgress');
+            const statusDiv = document.getElementById('pullStatus');
+            const progressBar = document.getElementById('progressBar');
+            const logsDiv = document.getElementById('pullLogs');
+            
+            progressDiv.style.display = 'block';
+            statusDiv.textContent = `Downloading ${modelName}...`;
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+            logsDiv.textContent = `Starting download of ${modelName}...\n`;
+            
+            try {
+                const response = await fetch(API_BASE + '/pull?model_name=' + encodeURIComponent(modelName), {
+                    method: 'POST'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n').filter(line => line.trim());
+                    
+                    for (const line of lines) {
+                        try {
+                            const data = JSON.parse(line);
+                            
+                            if (data.status) {
+                                statusDiv.textContent = data.status;
+                                logsDiv.textContent += data.status + '\n';
+                                logsDiv.scrollTop = logsDiv.scrollHeight;
+                            }
+                            
+                            if (data.completed && data.total) {
+                                const percent = Math.round((data.completed / data.total) * 100);
+                                progressBar.style.width = percent + '%';
+                                progressBar.textContent = percent + '%';
+                            }
+                            
+                            if (data.status === 'success' || (data.status && data.status.includes('up to date'))) {
+                                progressBar.style.width = '100%';
+                                progressBar.textContent = '100%';
+                                statusDiv.textContent = `✓ ${modelName} installed successfully!`;
+                                setTimeout(() => {
+                                    progressDiv.style.display = 'none';
+                                    loadInstalledModels();
+                                }, 2000);
+                            }
+                        } catch (e) {
+                            // Not JSON, skip
+                        }
+                    }
+                }
+                
+            } catch (error) {
+                console.error('Pull error:', error);
+                statusDiv.textContent = `✗ Failed to install ${modelName}: ${error.message}`;
+                logsDiv.textContent += `\nError: ${error.message}`;
+            }
+        }
+        
+        // Remove a model
+        async function removeModel(modelName) {
+            if (!confirm(`Are you sure you want to remove ${modelName}?`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(API_BASE + '/delete?model_name=' + encodeURIComponent(modelName), {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                alert(`${modelName} removed successfully!`);
+                loadInstalledModels();
+                
+            } catch (error) {
+                alert(`Error removing model: ${error.message}`);
+            }
+        }
+        
+        // Set active model
+        async function setActiveModel(modelName) {
+            try {
+                const response = await fetch(API_BASE + '/set-active?model_name=' + encodeURIComponent(modelName), {
+                    method: 'POST'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                // Store in localStorage
+                localStorage.setItem('activeModel', modelName);
+                document.getElementById('activeModel').innerHTML = `<span class="status-good">${modelName}</span>`;
+                
+                alert(data.message || `Model set to ${modelName}. Restart llm-service to apply.`);
+                loadInstalledModels();
+                
+            } catch (error) {
+                alert(`Error setting active model: ${error.message}`);
+            }
+        }
+        
+        // Initialize on load
+        async function initialize() {
+            await checkSystemStatus();
+            await loadInstalledModels();
+            
+            // Refresh status every 30 seconds
+            setInterval(async () => {
+                await checkSystemStatus();
+            }, 30000);
+        }
+        
+        // Start
+        initialize();
+    </script>
+</body>
+</html>

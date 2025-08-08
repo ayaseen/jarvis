@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import httpx
 import json
 import asyncio
@@ -239,3 +240,126 @@ async def root():
             "health": "/health"
         }
     }
+
+
+@app.get("/api/models/tags")
+async def get_ollama_models():
+    """Proxy to Ollama tags endpoint"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"http://ollama:11434/api/tags")
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as e:
+        logger.error(f"Failed to get models from Ollama: {e}")
+        raise HTTPException(status_code=503, detail=f"Ollama service unavailable: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error getting models: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/models/pull")
+async def pull_ollama_model(model_name: str):
+    """Pull/download a model through Ollama"""
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            # Stream the response from Ollama
+            async with client.stream(
+                "POST",
+                "http://ollama:11434/api/pull",
+                json={"name": model_name, "stream": True},
+                timeout=None
+            ) as response:
+                response.raise_for_status()
+                
+                async def generate():
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                
+                return StreamingResponse(
+                    generate(),
+                    media_type="application/x-ndjson"
+                )
+    except httpx.HTTPError as e:
+        logger.error(f"Failed to pull model {model_name}: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to pull model: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error pulling model: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/models/delete")
+async def delete_ollama_model(model_name: str):
+    """Delete a model from Ollama"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                "DELETE",
+                "http://ollama:11434/api/delete",
+                json={"name": model_name}
+            )
+            response.raise_for_status()
+            return {"status": "success", "message": f"Model {model_name} deleted"}
+    except httpx.HTTPError as e:
+        logger.error(f"Failed to delete model {model_name}: {e}")
+        raise HTTPException(status_code=503, detail=f"Failed to delete model: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error deleting model: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/models/status")
+async def get_model_status():
+    """Get current model status"""
+    try:
+        # Check Ollama health
+        ollama_healthy = False
+        models_count = 0
+        active_model = os.getenv('MODEL_NAME', 'Not set')
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get("http://ollama:11434/api/tags")
+                if response.status_code == 200:
+                    ollama_healthy = True
+                    data = response.json()
+                    models_count = len(data.get("models", []))
+        except:
+            pass
+        
+        return {
+            "ollama_healthy": ollama_healthy,
+            "active_model": active_model,
+            "models_count": models_count,
+            "gpu_enabled": True  # Since we configured GPU
+        }
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        return {
+            "ollama_healthy": False,
+            "error": str(e)
+        }
+
+@app.post("/api/models/set-active")
+async def set_active_model(model_name: str):
+    """Set the active model (updates environment variable)"""
+    try:
+        # Check if model exists first
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get("http://ollama:11434/api/tags")
+            data = response.json()
+            models = [m.get("name") for m in data.get("models", [])]
+            
+            if model_name not in models:
+                raise HTTPException(status_code=404, detail=f"Model {model_name} not found")
+        
+        # Update environment variable
+        os.environ['MODEL_NAME'] = model_name
+        
+        return {
+            "status": "success",
+            "active_model": model_name,
+            "message": f"Model set to {model_name}. Restart llm-service to apply."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting active model: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
