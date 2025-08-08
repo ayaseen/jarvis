@@ -1,19 +1,10 @@
-# docker-compose.yml
 version: '3.8'
-
-x-gpu-service: &gpu-config
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: all
-            capabilities: [gpu]
 
 x-common-variables: &common-variables
   PUID: ${PUID:-1000}
-  PGID: ${PGID:-1000}
+  PGID: ${PGID:-1001}
   TZ: ${TZ:-UTC}
+
 
 networks:
   jarvis-network:
@@ -80,7 +71,6 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: jarvis-ollama
-    <<: *gpu-config
     environment:
       <<: *common-variables
       OLLAMA_KEEP_ALIVE: "24h"
@@ -93,14 +83,29 @@ services:
       - /mnt/appsdata/jarvis/scripts:/scripts:ro
     networks:
       - jarvis-network
+    # GPU Configuration for Arch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']  # or 'all' for all GPUs
+              capabilities: [gpu]
     restart: unless-stopped
 
   # ============= JARVIS Services =============
   
   llm-service:
-    image: felix971/jarvis-llm:latest
+    image: felix971/jarvis-llm:v1.0.0
     container_name: jarvis-llm
-    <<: *gpu-config
+    # Add GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
     environment:
       <<: *common-variables
       OLLAMA_HOST: ollama
@@ -108,6 +113,9 @@ services:
       MODEL_NAME: ${LLM_MODEL:-mixtral:8x7b-instruct-v0.1-q4_K_M}
       CUDA_VISIBLE_DEVICES: "0"
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      # Add these for better GPU usage
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8001:8001"
     volumes:
@@ -121,9 +129,16 @@ services:
     restart: unless-stopped
 
   rag-service:
-    image: felix971/jarvis-rag:latest
+    image: felix971/jarvis-rag:v1.0.0
     container_name: jarvis-rag
-    <<: *gpu-config
+    # Add GPU support for embeddings
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
     environment:
       <<: *common-variables
       QDRANT_HOST: qdrant
@@ -134,6 +149,9 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
       TRANSFORMERS_CACHE: /models/transformers
+      # Add these for better GPU usage
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8002:8002"
     volumes:
@@ -149,9 +167,16 @@ services:
     restart: unless-stopped
 
   voice-service:
-    image: felix971/jarvis-voice:latest
+    image: felix971/jarvis-voice:v1.0.0
     container_name: jarvis-voice
-    <<: *gpu-config
+    # Add GPU support for Whisper and TTS
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
     environment:
       <<: *common-variables
       WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
@@ -160,6 +185,9 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
       WHISPER_CACHE: /models/whisper
       TTS_CACHE: /models/tts
+      # Add these for better GPU usage
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8003:8003"
     volumes:
@@ -172,7 +200,7 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    image: felix971/jarvis-orchestrator:latest
+    image: felix971/jarvis-orchestrator:v1.0.0
     container_name: jarvis-orchestrator
     environment:
       <<: *common-variables
@@ -197,7 +225,7 @@ services:
     restart: unless-stopped
 
   web:
-    image: felix971/jarvis-web:latest
+    image: felix971/jarvis-web:v1.0.0
     container_name: jarvis-web
     environment:
       <<: *common-variables
@@ -219,7 +247,7 @@ services:
     environment:
       <<: *common-variables
     ports:
-      - "9090:9090"
+      - "9098:9098"
     volumes:
       - /mnt/appsdata/jarvis/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - /mnt/appsdata/jarvis/prometheus:/prometheus
