@@ -71,8 +71,8 @@ class VoiceEngine:
             ("synthesizer", "tts_config", "audio", "output_sample_rate"),
             ("synthesizer", "tts_model", "config", "audio", "output_sample_rate"),
             ("synthesizer", "tts_model", "config", "audio", "sample_rate"),
-        ];
-        :
+        ]:
+
             obj = self.tts
             try:
                 for attr in chain:

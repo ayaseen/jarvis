@@ -40,7 +40,6 @@ for service in "${services[@]}"; do
     
     # Build the image
     if docker build \
-        --no-cache \
         -t "$DOCKER_USER/jarvis-$service:$VERSION" \
         "./services/$service"; then
         

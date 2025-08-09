@@ -1,69 +1,34 @@
-# /mnt/appsdata/jarvis/config/qdrant.yaml
-
-# Qdrant configuration optimized for JARVIS
 debug: false
 log_level: INFO
 
 service:
-  # API Configuration
   http_port: 6333
   grpc_port: 6334
   host: 0.0.0.0
-  
-  # Performance settings
   max_request_size_mb: 32
-  max_workers: 0  # 0 = number of CPU cores
+  max_workers: 0
   enable_cors: true
 
 storage:
-  # Storage configuration
   storage_path: /qdrant/storage
-  
-  # Performance optimizations
   wal:
     wal_capacity_mb: 32
     wal_segments_ahead: 0
-  
-  # Optimized for SSD
   optimizers:
     deleted_threshold: 0.2
     vacuum_min_vector_number: 1000
-    default_segment_number: 0  # Auto
-    max_segment_size_kb: 200000  # 200MB segments
+    default_segment_number: 0
+    max_segment_size_kb: 200000
     memmap_threshold_kb: 50000
-    indexing_threshold: 20000
     flush_interval_sec: 5
     max_optimization_threads: 2
-
-  # HNSW index configuration (for fast similarity search)
   hnsw_index:
-    m: 16  # Number of bi-directional links
-    ef_construct: 100  # Build-time accuracy/speed trade-off
-    full_scan_threshold: 10000
-    max_indexing_threads: 0  # 0 = auto
-    on_disk: false  # Keep in RAM for speed (you have enough RAM)
-    payload_m: null
-    
+    m: 16
+    ef_construct: 100
+    on_disk: false
   performance:
-    # Optimizations for better performance
-    max_search_threads: 0  # 0 = auto
+    max_search_threads: 0
     max_optimize_threads: 2
 
-# Collection defaults
-collections:
-  # Default parameters for new collections
-  default:
-    replication_factor: 1
-    write_consistency_factor: 1
-    shard_number: 1
-    on_disk_payload: false
-
-# Telemetry (optional - disable for privacy)
 telemetry:
   disabled: true
-  
-# TLS Configuration (optional - for production)
-# tls:
-#   enabled: false
-#   cert: /path/to/cert.pem
-#   key: /path/to/key.pem

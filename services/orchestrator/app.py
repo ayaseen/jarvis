@@ -1,5 +1,5 @@
 # services/orchestrator/app.py
-from fastapi import FastAPI, WebSocket, HTTPException, Query
+from fastapi import FastAPI, WebSocket, HTTPException, Query, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
 import httpx
@@ -31,7 +31,8 @@ app.add_middleware(
 LLM_SERVICE = os.getenv('LLM_SERVICE_URL', 'http://llm-service:8001')
 RAG_SERVICE = os.getenv('RAG_SERVICE_URL', 'http://rag-service:8002')
 VOICE_SERVICE = os.getenv('VOICE_SERVICE_URL', 'http://voice-service:8003')
-OLLAMA_URL = 'http://ollama:11434'
+VLLM_URL = os.getenv('VLLM_URL', 'http://vllm:8000')
+VLLM_API_KEY = os.getenv('VLLM_API_KEY', 'jarvis-key-123')
 
 # Redis connection
 try:
@@ -225,16 +226,19 @@ async def health_check():
         logger.error(f"Redis health check failed: {e}")
         health_status["redis"] = {"status": "unhealthy"}
     
-    # Check Ollama
+    # Check vLLM
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response = await client.get(
+                f"{VLLM_URL}/health",
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
+            )
             if response.status_code == 200:
-                health_status["ollama"] = {"status": "healthy"}
+                health_status["vllm"] = {"status": "healthy"}
             else:
-                health_status["ollama"] = {"status": "unhealthy"}
+                health_status["vllm"] = {"status": "unhealthy"}
     except Exception as e:
-        health_status["ollama"] = {"status": "unhealthy", "error": str(e)}
+        health_status["vllm"] = {"status": "unhealthy", "error": str(e)}
     
     all_healthy = all(
         s.get("status") == "healthy" 
@@ -258,220 +262,200 @@ async def root():
             "chat": "/chat",
             "health": "/health",
             "models": {
+                "info": "/api/models/info",
                 "status": "/api/models/status",
-                "tags": "/api/models/tags",
-                "pull": "/api/models/pull",
-                "delete": "/api/models/delete",
-                "set_active": "/api/models/set-active"
+                "config": "/api/models/config",
+                "available": "/api/models/available"
             }
         }
     }
 
-# ============= MODEL MANAGEMENT API =============
+# ============= MODEL MANAGEMENT API FOR vLLM =============
 
-@app.get("/api/models/tags")
-async def get_ollama_models():
-    """Get list of installed models from Ollama"""
+@app.get("/api/models/info")
+async def get_vllm_model_info():
+    """Get current model info from vLLM"""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{OLLAMA_URL}/api/tags")
+            response = await client.get(
+                f"{VLLM_URL}/v1/models",
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
+            )
             response.raise_for_status()
             data = response.json()
             
-            # Get the currently active model
-            active_model = os.getenv('MODEL_NAME', 'mixtral:8x7b-instruct-v0.1-q4_K_M')
-            
-            # Mark which model is active
-            if data.get("models"):
-                for model in data["models"]:
-                    model["is_active"] = (model.get("name") == active_model)
+            # Add additional info
+            current_model = os.getenv('VLLM_MODEL', 'Unknown')
+            data['current_config'] = {
+                'model': current_model,
+                'max_model_len': os.getenv('VLLM_MAX_MODEL_LEN', '4096'),
+                'gpu_memory_utilization': os.getenv('VLLM_GPU_MEMORY', '0.9'),
+                'quantization': os.getenv('VLLM_QUANTIZATION', 'awq')
+            }
             
             return data
     except httpx.ConnectError as e:
-        logger.error(f"Cannot connect to Ollama: {e}")
-        raise HTTPException(status_code=503, detail="Cannot connect to Ollama service")
+        logger.error(f"Cannot connect to vLLM: {e}")
+        raise HTTPException(status_code=503, detail="Cannot connect to vLLM service")
     except httpx.HTTPError as e:
-        logger.error(f"Failed to get models from Ollama: {e}")
-        raise HTTPException(status_code=503, detail=f"Ollama service error: {str(e)}")
+        logger.error(f"Failed to get model info from vLLM: {e}")
+        raise HTTPException(status_code=503, detail=f"vLLM service error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error getting models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/models/pull")
-async def pull_ollama_model(model_name: str = Query(..., description="Model name to pull")):
-    """Pull/download a model through Ollama with proper streaming"""
-    logger.info(f"Pulling model: {model_name}")
-    
-    try:
-        # Create a very long timeout for large model downloads
-        timeout = httpx.Timeout(7200.0, connect=60.0)  # 2 hours total, 1 minute connect
-        
-        async def stream_generator():
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                try:
-                    # Make the request to Ollama
-                    async with client.stream(
-                        "POST",
-                        f"{OLLAMA_URL}/api/pull",
-                        json={"name": model_name, "stream": True}
-                    ) as response:
-                        response.raise_for_status()
-                        
-                        # Stream the response chunks
-                        async for chunk in response.aiter_bytes():
-                            if chunk:
-                                yield chunk
-                                
-                except httpx.ConnectError:
-                    error_data = json.dumps({
-                        "error": "Cannot connect to Ollama service",
-                        "status": "Connection failed - is Ollama running?"
-                    })
-                    yield error_data.encode() + b'\n'
-                except httpx.TimeoutException:
-                    error_data = json.dumps({
-                        "error": "Download timeout",
-                        "status": "Timeout - model too large, use manual pull"
-                    })
-                    yield error_data.encode() + b'\n'
-                except Exception as e:
-                    logger.error(f"Stream error: {e}")
-                    error_data = json.dumps({
-                        "error": str(e),
-                        "status": f"Error: {str(e)}"
-                    })
-                    yield error_data.encode() + b'\n'
-        
-        return StreamingResponse(
-            stream_generator(),
-            media_type="application/x-ndjson",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "*"
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"Error initiating pull: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/models/delete")
-async def delete_ollama_model(model_name: str = Query(..., description="Model name to delete")):
-    """Delete a model from Ollama"""
-    logger.info(f"Deleting model: {model_name}")
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(
-                "DELETE",
-                f"{OLLAMA_URL}/api/delete",
-                json={"name": model_name}
-            )
-            response.raise_for_status()
-            return {"status": "success", "message": f"Model {model_name} deleted"}
-    except httpx.ConnectError as e:
-        logger.error(f"Cannot connect to Ollama for delete: {e}")
-        raise HTTPException(status_code=503, detail="Cannot connect to Ollama service")
-    except httpx.HTTPError as e:
-        logger.error(f"Failed to delete model {model_name}: {e}")
-        raise HTTPException(status_code=503, detail=f"Failed to delete model: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error deleting model: {e}")
+        logger.error(f"Error getting model info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/models/status")
 async def get_model_status():
     """Get current model status and system info"""
     try:
-        ollama_healthy = False
-        models_count = 0
-        active_model = os.getenv('MODEL_NAME', 'mixtral:8x7b-instruct-v0.1-q4_K_M')
+        vllm_healthy = False
+        model_loaded = False
+        current_model = os.getenv('VLLM_MODEL', 'Not configured')
         
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{OLLAMA_URL}/api/tags")
-                if response.status_code == 200:
-                    ollama_healthy = True
-                    data = response.json()
-                    models_count = len(data.get("models", []))
+                # Check health
+                health_response = await client.get(
+                    f"{VLLM_URL}/health",
+                    headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
+                )
+                vllm_healthy = health_response.status_code == 200
+                
+                # Check loaded model
+                if vllm_healthy:
+                    models_response = await client.get(
+                        f"{VLLM_URL}/v1/models",
+                        headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
+                    )
+                    if models_response.status_code == 200:
+                        models_data = models_response.json()
+                        model_loaded = len(models_data.get("data", [])) > 0
+                        if model_loaded and models_data["data"]:
+                            current_model = models_data["data"][0].get("id", current_model)
         except Exception as e:
-            logger.error(f"Ollama status check failed: {e}")
+            logger.error(f"vLLM status check failed: {e}")
         
         # Check if GPU is available
         gpu_enabled = os.path.exists('/dev/nvidia0') or 'CUDA_VISIBLE_DEVICES' in os.environ
         
         return {
-            "ollama_healthy": ollama_healthy,
-            "active_model": active_model,
-            "models_count": models_count,
+            "vllm_healthy": vllm_healthy,
+            "model_loaded": model_loaded,
+            "current_model": current_model,
             "gpu_enabled": gpu_enabled,
-            "ollama_url": OLLAMA_URL
+            "vllm_url": VLLM_URL,
+            "config": {
+                "max_model_len": os.getenv('VLLM_MAX_MODEL_LEN', '4096'),
+                "gpu_memory_utilization": os.getenv('VLLM_GPU_MEMORY', '0.9'),
+                "quantization": os.getenv('VLLM_QUANTIZATION', 'awq')
+            }
         }
     except Exception as e:
         logger.error(f"Error getting status: {e}")
         return {
-            "ollama_healthy": False,
+            "vllm_healthy": False,
             "error": str(e)
         }
 
-@app.post("/api/models/set-active")
-async def set_active_model(model_name: str = Query(..., description="Model name to set as active")):
-    """Set the active model for the LLM service"""
-    logger.info(f"Setting active model to: {model_name}")
-    
+@app.get("/api/models/available")
+async def get_available_models():
+    """Get list of recommended models for vLLM with 12GB VRAM"""
+    return {
+        "recommended_12gb": [
+            {
+                "name": "TheBloke/Mistral-7B-Instruct-v0.2-AWQ",
+                "size": "4.2GB",
+                "description": "Excellent general-purpose model, fast inference",
+                "quantization": "AWQ",
+                "max_context": 32768
+            },
+            {
+                "name": "TheBloke/Llama-2-7B-Chat-AWQ",
+                "size": "3.9GB",
+                "description": "Meta's conversational AI, good for chat",
+                "quantization": "AWQ",
+                "max_context": 4096
+            },
+            {
+                "name": "TheBloke/neural-chat-7B-v3-3-AWQ",
+                "size": "4.1GB",
+                "description": "Intel's fine-tuned chat model",
+                "quantization": "AWQ",
+                "max_context": 8192
+            },
+            {
+                "name": "TheBloke/zephyr-7B-beta-AWQ",
+                "size": "4.2GB",
+                "description": "HuggingFace's aligned chat model",
+                "quantization": "AWQ",
+                "max_context": 32768
+            },
+            {
+                "name": "TheBloke/OpenHermes-2.5-Mistral-7B-AWQ",
+                "size": "4.2GB",
+                "description": "High-quality instruction-following model",
+                "quantization": "AWQ",
+                "max_context": 32768
+            },
+            {
+                "name": "TheBloke/Starling-LM-7B-alpha-AWQ",
+                "size": "4.2GB",
+                "description": "Berkeley's RLHF model, very capable",
+                "quantization": "AWQ",
+                "max_context": 8192
+            }
+        ],
+        "small_models": [
+            {
+                "name": "microsoft/phi-2",
+                "size": "2.7GB",
+                "description": "Tiny but capable model",
+                "quantization": "none",
+                "max_context": 2048
+            },
+            {
+                "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                "size": "1.1GB",
+                "description": "Very small, fast model",
+                "quantization": "none",
+                "max_context": 2048
+            }
+        ],
+        "notes": {
+            "awq_models": "AWQ quantization provides best balance of quality and speed for RTX 4070 Ti",
+            "memory_usage": "With 12GB VRAM, 7B AWQ models leave room for context and batch processing",
+            "performance": "Expect 50-100+ tokens/sec with AWQ models on RTX 4070 Ti"
+        }
+    }
+
+@app.post("/api/models/config")
+async def update_model_config(
+    model: str = Query(..., description="Model name/path"),
+    max_model_len: int = Query(4096, description="Maximum model length"),
+    gpu_memory: float = Query(0.9, description="GPU memory utilization (0-1)")
+):
+    """Update vLLM configuration (requires container restart)"""
     try:
-        # Check if model exists first
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{OLLAMA_URL}/api/tags")
-            data = response.json()
-            models = [m.get("name") for m in data.get("models", [])]
-            
-            if model_name not in models:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"Model {model_name} not found. Please install it first."
-                )
-        
-        # Update environment variable
-        os.environ['MODEL_NAME'] = model_name
-        
-        # Try to update .env file if it exists
-        env_file_path = '/app/.env'
-        if os.path.exists(env_file_path):
-            try:
-                with open(env_file_path, 'r') as f:
-                    lines = f.readlines()
-                
-                with open(env_file_path, 'w') as f:
-                    model_found = False
-                    for line in lines:
-                        if line.startswith('MODEL_NAME='):
-                            f.write(f'MODEL_NAME={model_name}\n')
-                            model_found = True
-                        else:
-                            f.write(line)
-                    
-                    if not model_found:
-                        f.write(f'MODEL_NAME={model_name}\n')
-            except Exception as e:
-                logger.warning(f"Could not update .env file: {e}")
+        # Update environment variables
+        os.environ['VLLM_MODEL'] = model
+        os.environ['VLLM_MAX_MODEL_LEN'] = str(max_model_len)
+        os.environ['VLLM_GPU_MEMORY'] = str(gpu_memory)
         
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
-                "active_model": model_name,
-                "message": f"Model set to {model_name}. Please run: docker-compose restart llm-service"
+                "message": "Configuration updated. Please restart vLLM container to apply changes.",
+                "config": {
+                    "model": model,
+                    "max_model_len": max_model_len,
+                    "gpu_memory": gpu_memory
+                },
+                "restart_command": "docker-compose restart vllm llm-service"
             }
         )
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Error setting active model: {e}")
+        logger.error(f"Error updating config: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.options("/api/models/{path:path}")
@@ -481,24 +465,10 @@ async def options_handler():
         status_code=200,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
         }
     )
-
-@app.get("/api/models/test-pull")
-async def test_pull_connectivity():
-    """Test if we can connect to Ollama for pulling models"""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            # Just test if Ollama is reachable
-            response = await client.get(f"{OLLAMA_URL}/api/version")
-            if response.status_code == 200:
-                return {"status": "ready", "ollama": "connected", "can_pull": True}
-            else:
-                return {"status": "error", "ollama": "unreachable", "can_pull": False}
-    except Exception as e:
-        return {"status": "error", "error": str(e), "can_pull": False}
 
 # Additional error handling
 @app.exception_handler(httpx.ConnectError)
@@ -514,3 +484,194 @@ async def timeout_error_handler(request, exc):
         status_code=504,
         content={"detail": "Request timeout. The operation is taking longer than expected."}
     )
+
+# ============= DOCUMENT/RAG MANAGEMENT API =============
+
+@app.post("/api/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Proxy document upload to RAG service"""
+    try:
+        # Forward the file to RAG service
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            files = {"file": (file.filename, await file.read(), file.content_type)}
+            response = await client.post(
+                f"{RAG_SERVICE}/ingest",
+                files=files
+            )
+            response.raise_for_status()
+
+            result = response.json()
+
+            # Store document info in Redis if available
+            if redis_client and result.get("status") == "success":
+                doc_info = {
+                    "id": str(uuid.uuid4()),
+                    "name": file.filename,
+                    "chunks": result.get("chunks_created", 0),
+                    "uploaded": datetime.now().isoformat(),
+                    "collection": result.get("collection", "documents")
+                }
+
+                # Store in Redis list
+                redis_client.lpush("jarvis:documents", json.dumps(doc_info))
+                redis_client.ltrim("jarvis:documents", 0, 99)  # Keep last 100 docs
+
+                result["document_id"] = doc_info["id"]
+
+            return result
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"RAG service error during upload: {e}")
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        logger.error(f"Document upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/documents/search")
+async def search_documents(
+    query: str = Query(..., description="Search query"),
+    collection: str = Query("documents", description="Collection name"),
+    top_k: int = Query(5, description="Number of results"),
+    threshold: float = Query(0.5, description="Similarity threshold")
+):
+    """Search documents using RAG service"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{RAG_SERVICE}/search",
+                json={
+                    "query": query,
+                    "collection": collection,
+                    "top_k": top_k,
+                    "threshold": threshold
+                }
+            )
+            response.raise_for_status()
+            return response.json()
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"RAG search error: {e}")
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/documents/list")
+async def list_documents():
+    """Get list of indexed documents from Redis"""
+    try:
+        if not redis_client:
+            return {"documents": [], "message": "Redis not available"}
+
+        # Get documents from Redis
+        doc_list = redis_client.lrange("jarvis:documents", 0, -1)
+        documents = []
+
+        for doc_json in doc_list:
+            try:
+                doc = json.loads(doc_json)
+                documents.append(doc)
+            except json.JSONDecodeError:
+                continue
+
+        # Get stats from Qdrant
+        stats = {}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"http://qdrant:6333/collections")
+                if response.status_code == 200:
+                    collections_data = response.json()
+                    stats["collections"] = len(collections_data.get("collections", []))
+
+                    # Get document collection info
+                    coll_response = await client.get(f"http://qdrant:6333/collections/documents")
+                    if coll_response.status_code == 200:
+                        coll_data = coll_response.json()
+                        stats["total_vectors"] = coll_data.get("result", {}).get("vectors_count", 0)
+        except Exception as e:
+            logger.warning(f"Could not get Qdrant stats: {e}")
+
+        return {
+            "documents": documents,
+            "total": len(documents),
+            "stats": stats
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing documents: {e}")
+        return {"documents": [], "error": str(e)}
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str):
+    """Remove a document from the index"""
+    try:
+        # Remove from Redis list
+        if redis_client:
+            doc_list = redis_client.lrange("jarvis:documents", 0, -1)
+            for doc_json in doc_list:
+                doc = json.loads(doc_json)
+                if doc.get("id") == document_id:
+                    redis_client.lrem("jarvis:documents", 1, doc_json)
+                    break
+
+        # Note: Actual vector removal from Qdrant would require storing point IDs
+        # This is a simplified version that just removes from the document list
+
+        return {"status": "success", "message": f"Document {document_id} removed from list"}
+
+    except Exception as e:
+        logger.error(f"Error deleting document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/documents/stats")
+async def get_document_stats():
+    """Get RAG system statistics"""
+    try:
+        stats = {
+            "rag_service": "unknown",
+            "qdrant": "unknown",
+            "total_documents": 0,
+            "total_chunks": 0,
+            "collections": 0
+        }
+
+        # Check RAG service
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{RAG_SERVICE}/health")
+                if response.status_code == 200:
+                    stats["rag_service"] = "healthy"
+                    health_data = response.json()
+                    stats.update(health_data)
+        except Exception:
+            stats["rag_service"] = "unhealthy"
+
+        # Check Qdrant
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get("http://qdrant:6333/collections")
+                if response.status_code == 200:
+                    stats["qdrant"] = "healthy"
+                    collections = response.json().get("collections", [])
+                    stats["collections"] = len(collections)
+
+                    # Get documents collection stats
+                    for collection in collections:
+                        if collection["name"] == "documents":
+                            stats["total_chunks"] = collection.get("vectors_count", 0)
+        except Exception:
+            stats["qdrant"] = "unhealthy"
+
+        # Get document count from Redis
+        if redis_client:
+            try:
+                doc_count = redis_client.llen("jarvis:documents")
+                stats["total_documents"] = doc_count
+            except Exception:
+                pass
+
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return {"error": str(e)}
