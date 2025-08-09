@@ -1,3 +1,6 @@
 models/
 postgres/
 redis/
+grafana/
+prometheus/
+qdrant/
