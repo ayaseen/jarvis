@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import whisper
 import torch
-from TTS.api import TTS  # coqui-tts keeps this import path
+from TTS.api import TTS
 import io
 import numpy as np
 import soundfile as sf
@@ -52,7 +52,7 @@ class VoiceEngine:
             logger.error(f"Failed to load Whisper model: {e}")
             self.whisper_model = None
 
-        # Load Coqui TTS (set device via .to(...))
+        # Load Coqui TTS
         try:
             self.tts = TTS(model_name=DEFAULT_TTS_MODEL, progress_bar=False).to(self.device)
             logger.info("TTS model loaded successfully")
@@ -65,14 +65,15 @@ class VoiceEngine:
         Try to discover the output sample rate from the TTS model/config.
         Fall back to 22050 if not found.
         """
-        for chain in [
+        chains = [
             ("output_sample_rate",),
             ("synthesizer", "output_sample_rate"),
             ("synthesizer", "tts_config", "audio", "output_sample_rate"),
             ("synthesizer", "tts_model", "config", "audio", "output_sample_rate"),
             ("synthesizer", "tts_model", "config", "audio", "sample_rate"),
-        ]:
+        ]
 
+        for chain in chains:
             obj = self.tts
             try:
                 for attr in chain:
@@ -199,5 +200,13 @@ async def synthesize_speech_base64(req: SynthesizeRequest):
         return {"audio": audio_base64, "format": "wav"}
     except Exception as e:
         logger.error(f"Synthesize base64 endpoint error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))  # Fixed: removed extra quote
 
+
+@app.get("/")
+async def root():
+    return {
+        "service": "JARVIS Voice Service",
+        "version": "1.0.0",
+        "status": "online"
+    }

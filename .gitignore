@@ -1,6 +1,57 @@
-models/
+# Data directories (should never be in git)
 postgres/
 redis/
+qdrant/
 grafana/
 prometheus/
-qdrant/
+
+# Model directories (too large for git)
+models/
+
+# Log files
+logs/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+
+# Docker volumes
+volumes/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.backup
+*.bak
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

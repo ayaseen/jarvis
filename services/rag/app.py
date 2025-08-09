@@ -13,13 +13,16 @@ import torch
 import uuid
 import traceback
 import asyncio
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="JARVIS RAG Service", version="1.0.0")
 
+# Service configuration with retry logic
 QDRANT_HOST = os.getenv('QDRANT_HOST', 'qdrant')
+QDRANT_PORT = int(os.getenv('QDRANT_PORT', '6333'))
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5')
 TRANSFORMERS_CACHE = os.getenv('TRANSFORMERS_CACHE', '/models/transformers')
 
@@ -50,12 +53,40 @@ class RAGEngine:
             raise
         
         self.qdrant = None
+        self.connection_retries = 0
+        self.max_retries = 30
 
     async def connect_to_qdrant(self):
-        self.qdrant = QdrantClient(host=QDRANT_HOST, port=6333, timeout=30)
-        self._init_collections()
+        """Connect to Qdrant with retry logic"""
+        while self.connection_retries < self.max_retries:
+            try:
+                self.qdrant = QdrantClient(
+                    host=QDRANT_HOST, 
+                    port=QDRANT_PORT, 
+                    timeout=30,
+                    grpc_port=None,  # Disable gRPC
+                    prefer_grpc=False  # Use HTTP
+                )
+                # Test connection
+                self.qdrant.get_collections()
+                logger.info(f"Connected to Qdrant at {QDRANT_HOST}:{QDRANT_PORT}")
+                self._init_collections()
+                return
+            except Exception as e:
+                self.connection_retries += 1
+                logger.warning(f"Qdrant connection attempt {self.connection_retries}/{self.max_retries} failed: {e}")
+                if self.connection_retries >= self.max_retries:
+                    logger.error("Max retries reached. Qdrant connection failed.")
+                    self.qdrant = None
+                    return
+                await asyncio.sleep(2)
     
     def _init_collections(self):
+        """Initialize collections with error handling"""
+        if not self.qdrant:
+            logger.warning("Qdrant client not initialized")
+            return
+            
         collections = {
             "documents": 768,
             "conversations": 768,
@@ -64,15 +95,25 @@ class RAGEngine:
         
         for name, dim in collections.items():
             try:
-                self.qdrant.recreate_collection(
-                    collection_name=name,
-                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE)
-                )
-                logger.info(f"Created collection: {name}")
+                # Check if collection exists
+                existing_collections = self.qdrant.get_collections()
+                exists = any(col.name == name for col in existing_collections.collections)
+                
+                if not exists:
+                    self.qdrant.create_collection(
+                        collection_name=name,
+                        vectors_config=VectorParams(size=dim, distance=Distance.COSINE)
+                    )
+                    logger.info(f"Created collection: {name}")
+                else:
+                    logger.info(f"Collection already exists: {name}")
             except Exception as e:
-                logger.warning(f"Collection {name} already exists or error: {e}")
+                logger.warning(f"Collection {name} initialization error: {e}")
     
     async def ingest_file(self, file: UploadFile) -> Dict[str, Any]:
+        if not self.qdrant:
+            raise HTTPException(status_code=503, detail="Qdrant service not available")
+            
         temp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
         
         try:
@@ -99,7 +140,7 @@ class RAGEngine:
                 try:
                     embedding = self.embedder.encode(chunk).tolist()
                     
-                    # Generate unique ID (use UUID for reliability)
+                    # Generate unique ID
                     chunk_id = str(uuid.uuid4())
                     
                     points.append(PointStruct(
@@ -130,7 +171,7 @@ class RAGEngine:
             
         except Exception as e:
             logger.error(f"Ingestion error: {traceback.format_exc()}")
-            raise
+            raise HTTPException(status_code=500, detail=str(e))
         finally:
             # Clean up
             if os.path.exists(temp_path):
@@ -186,6 +227,10 @@ class RAGEngine:
         return chunks
     
     async def search(self, request: RAGRequest) -> List[Dict[str, Any]]:
+        if not self.qdrant:
+            logger.warning("Qdrant not available, returning empty results")
+            return []
+            
         try:
             query_embedding = self.embedder.encode(request.query).tolist()
             
@@ -209,7 +254,7 @@ class RAGEngine:
             
         except Exception as e:
             logger.error(f"Search error: {traceback.format_exc()}")
-            raise
+            return []
 
 engine = None
 
@@ -223,32 +268,48 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to initialize RAG Engine: {e}")
         # Don't raise - let service start but return unhealthy
+        engine = RAGEngine()  # Create engine without qdrant connection
 
 @app.get("/health")
 async def health_check():
-    if not engine or not engine.qdrant:
-        raise HTTPException(status_code=503, detail="Engine not initialized or Qdrant not connected")
+    if not engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
     
-    try:
-        collections = engine.qdrant.get_collections()
-        return {
-            "status": "healthy",
-            "collections": len(collections.collections),
-            "embedding_model": EMBEDDING_MODEL,
-            "device": engine.device
-        }
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        raise HTTPException(status_code=503, detail=str(e))
+    qdrant_status = "disconnected"
+    collections_count = 0
+    
+    if engine.qdrant:
+        try:
+            collections = engine.qdrant.get_collections()
+            qdrant_status = "connected"
+            collections_count = len(collections.collections)
+        except Exception as e:
+            logger.error(f"Health check Qdrant error: {e}")
+            qdrant_status = "error"
+    
+    status = "healthy" if qdrant_status == "connected" else "degraded"
+    
+    return {
+        "status": status,
+        "qdrant_status": qdrant_status,
+        "collections": collections_count,
+        "embedding_model": EMBEDDING_MODEL,
+        "device": engine.device
+    }
 
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
     if not engine:
         raise HTTPException(status_code=503, detail="Engine not initialized")
     
+    if not engine.qdrant:
+        raise HTTPException(status_code=503, detail="Qdrant service not available")
+    
     try:
         result = await engine.ingest_file(file)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Ingest error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -264,3 +325,11 @@ async def search_documents(request: RAGRequest):
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    return {
+        "service": "JARVIS RAG Service",
+        "version": "1.0.0",
+        "status": "online"
+    }

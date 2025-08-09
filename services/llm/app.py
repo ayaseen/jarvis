@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 import asyncio
 import json
 import os
@@ -22,15 +22,24 @@ request_counter = Counter('llm_requests_total', 'Total LLM requests')
 response_time = Histogram('llm_response_duration_seconds', 'LLM response time')
 
 # Redis connection with error handling
+redis_client = None
 try:
+    redis_host = os.getenv('REDIS_HOST', 'redis')
     redis_client = redis.Redis(
-        host=os.getenv('REDIS_HOST', 'redis'),
+        host=redis_host,
         port=6379,
         decode_responses=True,
-        socket_connect_timeout=5
+        socket_connect_timeout=5,
+        retry_on_timeout=True,
+        socket_keepalive=True,
+        socket_keepalive_options={
+            1: 1,  # TCP_KEEPIDLE
+            2: 3,  # TCP_KEEPINTVAL  
+            3: 5   # TCP_KEEPCNT
+        }
     )
     redis_client.ping()
-    logger.info("Connected to Redis successfully")
+    logger.info(f"Connected to Redis at {redis_host}:6379")
 except Exception as e:
     logger.error(f"Redis connection failed: {e}")
     redis_client = None
@@ -55,18 +64,50 @@ class LLMEngine:
         self.model = MODEL_NAME
         self.api_key = VLLM_API_KEY
         self.client = None
+        self.vllm_available = False
+        self.last_check_time = 0
+        self.check_interval = 30  # Check vLLM availability every 30 seconds
     
     async def get_client(self):
         if not self.client:
             self.client = httpx.AsyncClient(
                 timeout=120.0,
-                headers={"Authorization": f"Bearer {self.api_key}"}
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
             )
         return self.client
+    
+    async def check_vllm_availability(self):
+        """Check if vLLM is available with caching"""
+        current_time = time.time()
+        if current_time - self.last_check_time < self.check_interval:
+            return self.vllm_available
+            
+        try:
+            client = await self.get_client()
+            response = await client.get(
+                f"http://{VLLM_HOST}:{VLLM_PORT}/health",
+                timeout=5.0
+            )
+            self.vllm_available = response.status_code == 200
+            self.last_check_time = current_time
+            if self.vllm_available:
+                logger.info("vLLM service is available")
+        except Exception as e:
+            logger.warning(f"vLLM health check failed: {e}")
+            self.vllm_available = False
+            self.last_check_time = current_time
+        
+        return self.vllm_available
     
     async def generate(self, request: ChatRequest) -> AsyncGenerator[str, None]:
         request_counter.inc()
         start_time = time.time()
+        
+        # Check vLLM availability first
+        if not await self.check_vllm_availability():
+            yield "Error: vLLM service is not available. Please ensure the vLLM container is running."
+            return
         
         try:
             # Get context from Redis if session_id provided
@@ -83,7 +124,7 @@ class LLMEngine:
                     
                     # Get last few messages for conversation history
                     history_key = f"session:{request.session_id}:history"
-                    history_data = redis_client.lrange(history_key, -10, -1)  # Last 10 messages
+                    history_data = redis_client.lrange(history_key, -10, -1)
                     for msg in history_data:
                         try:
                             conversation_history.append(json.loads(msg))
@@ -102,49 +143,54 @@ class LLMEngine:
             full_response = ""
             
             # Use vLLM's OpenAI-compatible chat completions endpoint
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": request.stream,
-                    "temperature": request.temperature,
-                    "max_tokens": request.max_tokens,
-                    "top_p": 0.95,
-                    "frequency_penalty": 0.0,
-                    "presence_penalty": 0.0,
-                }
-            ) as response:
-                response.raise_for_status()
-                
-                if request.stream:
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            line_data = line[6:]  # Remove "data: " prefix
-                            if line_data == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(line_data)
-                                if "choices" in data and data["choices"]:
-                                    delta = data["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_response += content
-                                        yield content
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Failed to parse: {line_data}, error: {e}")
-                else:
-                    # Non-streaming response
-                    response_data = await response.json()
-                    if "choices" in response_data and response_data["choices"]:
-                        full_response = response_data["choices"][0]["message"]["content"]
-                        yield full_response
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "stream": request.stream,
+                        "temperature": request.temperature,
+                        "max_tokens": request.max_tokens,
+                        "top_p": 0.95,
+                        "frequency_penalty": 0.0,
+                        "presence_penalty": 0.0,
+                    }
+                ) as response:
+                    response.raise_for_status()
+                    
+                    if request.stream:
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                line_data = line[6:]
+                                if line_data == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(line_data)
+                                    if "choices" in data and data["choices"]:
+                                        delta = data["choices"][0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            full_response += content
+                                            yield content
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"Failed to parse: {line_data}, error: {e}")
+                    else:
+                        # Non-streaming response
+                        response_data = await response.json()
+                        if "choices" in response_data and response_data["choices"]:
+                            full_response = response_data["choices"][0]["message"]["content"]
+                            yield full_response
+            except httpx.ConnectError as e:
+                logger.error(f"Connection error to vLLM: {e}")
+                self.vllm_available = False
+                yield f"Error: Cannot connect to vLLM service at {VLLM_HOST}:{VLLM_PORT}. Please check if the container is running."
+                return
             
             # Store conversation in Redis for context
             if request.session_id and redis_client and full_response:
                 try:
-                    # Store the conversation turn
                     history_key = f"session:{request.session_id}:history"
                     conversation_turn = {
                         "timestamp": time.time(),
@@ -152,19 +198,14 @@ class LLMEngine:
                         "assistant": full_response
                     }
                     redis_client.rpush(history_key, json.dumps(conversation_turn))
-                    
-                    # Keep only last 20 turns
                     redis_client.ltrim(history_key, -20, -1)
-                    
-                    # Set expiry to 1 hour
                     redis_client.expire(history_key, 3600)
                     
-                    # Update context summary (optional - for RAG integration)
                     context_key = f"session:{request.session_id}:context"
                     context_data = {
                         "last_interaction": time.time(),
                         "turns": redis_client.llen(history_key),
-                        "last_topic": request.prompt[:100]  # Store topic hint
+                        "last_topic": request.prompt[:100]
                     }
                     redis_client.setex(context_key, 3600, json.dumps(context_data))
                     
@@ -174,9 +215,9 @@ class LLMEngine:
         except httpx.HTTPStatusError as e:
             logger.error(f"vLLM API error: {e.response.text}")
             yield f"Error: vLLM service error - {e.response.status_code}"
-        except httpx.ConnectError as e:
-            logger.error(f"Cannot connect to vLLM: {e}")
-            yield "Error: Cannot connect to vLLM service. Please check if it's running."
+        except httpx.TimeoutException as e:
+            logger.error(f"vLLM timeout: {e}")
+            yield "Error: Request to vLLM timed out. The model might be loading or overwhelmed."
         except Exception as e:
             logger.error(f"Generation error: {traceback.format_exc()}")
             yield f"Error: {str(e)}"
@@ -224,22 +265,43 @@ engine = LLMEngine()
 @app.get("/health")
 async def health_check():
     try:
-        client = await engine.get_client()
+        # Check vLLM
+        vllm_status = "unavailable"
+        vllm_details = {"status": "checking"}
+        model_info = {}
         
-        # Check vLLM health endpoint
-        try:
-            response = await client.get(f"http://{VLLM_HOST}:{VLLM_PORT}/health")
-            vllm_status = "healthy" if response.status_code == 200 else "unhealthy"
-            vllm_details = {"status": vllm_status, "code": response.status_code}
-        except httpx.ConnectError:
-            vllm_status = "unreachable"
-            vllm_details = {"status": "unreachable", "error": "Cannot connect to vLLM"}
-        except Exception as e:
-            vllm_status = "error"
-            vllm_details = {"status": "error", "error": str(e)}
+        if await engine.check_vllm_availability():
+            try:
+                client = await engine.get_client()
+                
+                # Get detailed vLLM status
+                response = await client.get(
+                    f"http://{VLLM_HOST}:{VLLM_PORT}/health",
+                    timeout=5.0
+                )
+                if response.status_code == 200:
+                    vllm_status = "healthy"
+                    vllm_details = {"status": "healthy", "code": 200}
+                    
+                    # Try to get model info
+                    try:
+                        models_response = await client.get(
+                            f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models",
+                            timeout=5.0
+                        )
+                        if models_response.status_code == 200:
+                            model_info = models_response.json()
+                    except Exception as e:
+                        logger.warning(f"Could not get model info: {e}")
+                        
+            except Exception as e:
+                vllm_details = {"status": "error", "error": str(e)}
+        else:
+            vllm_details = {"status": "unavailable", "message": f"Cannot reach vLLM at {VLLM_HOST}:{VLLM_PORT}"}
         
         # Check Redis
         redis_status = "healthy"
+        redis_details = {}
         if redis_client:
             try:
                 redis_client.ping()
@@ -256,16 +318,6 @@ async def health_check():
             redis_status = "not configured"
             redis_details = {"status": "not configured"}
         
-        # Get model info if vLLM is healthy
-        model_info = {}
-        if vllm_status == "healthy":
-            try:
-                models_response = await client.get(f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models")
-                if models_response.status_code == 200:
-                    model_info = models_response.json()
-            except Exception as e:
-                logger.warning(f"Could not get model info: {e}")
-        
         overall_status = "healthy" if vllm_status == "healthy" else "degraded"
         
         return {
@@ -276,7 +328,7 @@ async def health_check():
                 "redis": redis_details
             },
             "model_info": model_info,
-            "device": engine.device if hasattr(engine, 'device') else "unknown"
+            "vllm_endpoint": f"http://{VLLM_HOST}:{VLLM_PORT}"
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -313,12 +365,15 @@ async def metrics():
 
 @app.get("/")
 async def root():
+    vllm_status = "available" if await engine.check_vllm_availability() else "unavailable"
     return {
         "service": "JARVIS LLM Service",
         "version": "1.0.0",
         "model": MODEL_NAME,
         "backend": "vLLM",
-        "status": "online"
+        "status": "online",
+        "vllm_status": vllm_status,
+        "vllm_endpoint": f"http://{VLLM_HOST}:{VLLM_PORT}"
     }
 
 @app.post("/clear-session")
@@ -346,17 +401,16 @@ async def startup_event():
     logger.info(f"Starting LLM Service with vLLM model: {MODEL_NAME}")
     logger.info(f"vLLM endpoint: http://{VLLM_HOST}:{VLLM_PORT}")
     
-    # Wait for vLLM to be ready
+    # Try to connect to vLLM with retries
     max_retries = 30
     for i in range(max_retries):
         try:
-            client = await engine.get_client()
-            response = await client.get(f"http://{VLLM_HOST}:{VLLM_PORT}/health")
-            if response.status_code == 200:
+            if await engine.check_vllm_availability():
                 logger.info("Connected to vLLM successfully")
                 
                 # Get model info
                 try:
+                    client = await engine.get_client()
                     models_response = await client.get(f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models")
                     if models_response.status_code == 200:
                         models_data = models_response.json()
@@ -366,9 +420,10 @@ async def startup_event():
                 break
         except Exception as e:
             logger.info(f"Waiting for vLLM... ({i+1}/{max_retries}): {e}")
-            await asyncio.sleep(2)
+            
+        await asyncio.sleep(2)
     else:
-        logger.warning("Could not connect to vLLM after maximum retries. Service will start but may not function properly.")
+        logger.warning("Could not connect to vLLM after maximum retries. Service will continue checking in background.")
 
 @app.on_event("shutdown")
 async def shutdown_event():

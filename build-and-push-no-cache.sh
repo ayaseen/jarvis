@@ -3,8 +3,18 @@
 
 set -e
 
-# Docker Hub username
-DOCKER_USER="felix971"
+# Load credentials from .env.registry file
+if [ -f .env.registry ]; then
+    source .env.registry
+else
+    echo "ERROR: .env.registry file not found!"
+    echo "Create .env.registry with:"
+    exit 1
+fi
+
+# Private Registry Configuration
+REGISTRY="hub.rhlab.dev"
+REGISTRY_NAMESPACE="jarvis"
 VERSION="${1:-latest}"
 
 # Colors for output
@@ -15,15 +25,21 @@ NC='\033[0m' # No Color
 
 echo -e "${GREEN}🚀 Building and pushing JARVIS Docker images${NC}"
 echo "============================================"
-echo "Registry: $DOCKER_USER"
+echo "Registry: $REGISTRY/$REGISTRY_NAMESPACE"
 echo "Version: $VERSION"
+echo "User: $REGISTRY_USER"
 echo ""
 
-# Check if logged in to Docker Hub
-if ! docker info 2>/dev/null | grep -q "Username: $DOCKER_USER"; then
-    echo -e "${YELLOW}⚠️  Not logged in to Docker Hub${NC}"
-    docker login -u $DOCKER_USER
+# Login to private registry
+echo -e "${YELLOW}🔐 Logging in to $REGISTRY...${NC}"
+echo "$REGISTRY_PASS" | docker login $REGISTRY -u "$REGISTRY_USER" --password-stdin
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✅ Successfully logged in to $REGISTRY${NC}"
+else
+    echo -e "${RED}❌ Failed to login to $REGISTRY${NC}"
+    exit 1
 fi
+echo ""
 
 # Array of services to build
 services=(
@@ -38,18 +54,20 @@ services=(
 for service in "${services[@]}"; do
     echo -e "${YELLOW}📦 Building $service...${NC}"
     
-    # Build the image
+    # Build the image with private registry tag
     if docker build \
         --no-cache \
-        -t "$DOCKER_USER/jarvis-$service:$VERSION" \
+        -t "$REGISTRY/$REGISTRY_NAMESPACE/$service:$VERSION" \
+        -t "$REGISTRY/$REGISTRY_NAMESPACE/$service:latest" \
         "./services/$service"; then
         
         echo -e "${GREEN}✅ Build successful${NC}"
         
-        echo -e "${YELLOW}📤 Pushing $service to Docker Hub...${NC}"
+        echo -e "${YELLOW}📤 Pushing $service to $REGISTRY...${NC}"
         
-        # Push both tags
-        docker push "$DOCKER_USER/jarvis-$service:$VERSION"
+        # Push both version tag and latest tag
+        docker push "$REGISTRY/$REGISTRY_NAMESPACE/$service:$VERSION"
+        docker push "$REGISTRY/$REGISTRY_NAMESPACE/$service:latest"
         
         echo -e "${GREEN}✅ $service complete!${NC}"
     else
@@ -60,11 +78,17 @@ for service in "${services[@]}"; do
     echo ""
 done
 
+# Logout for security
+docker logout $REGISTRY
+echo -e "${YELLOW}🔒 Logged out from $REGISTRY${NC}"
+
+echo ""
 echo -e "${GREEN}🎉 All images built and pushed successfully!${NC}"
 echo ""
 echo "📋 Images available:"
 for service in "${services[@]}"; do
-    echo "   - $DOCKER_USER/jarvis-$service:$VERSION"
+    echo "   - $REGISTRY/$REGISTRY_NAMESPACE/$service:$VERSION"
+    echo "   - $REGISTRY/$REGISTRY_NAMESPACE/$service:latest"
 done
 
 echo ""
