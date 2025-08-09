@@ -2,9 +2,8 @@ version: '3.8'
 
 x-common-variables: &common-variables
   PUID: ${PUID:-1000}
-  PGID: ${PGID:-1001}
+  PGID: ${PGID:-1002}
   TZ: ${TZ:-UTC}
-
 
 networks:
   jarvis-network:
@@ -68,37 +67,86 @@ services:
       - jarvis-network
     restart: unless-stopped
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: jarvis-ollama
+  # ============= vLLM Service (Replaces Ollama) =============
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   container_name: jarvis-vllm
+  #   environment:
+  #     <<: *common-variables
+  #     HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
+  #   ports:
+  #     - "8080:8000"  # vLLM API on port 8080 to avoid conflict
+  #   volumes:
+  #     - /mnt/appsdata/jarvis/models/vllm:/root/.cache/huggingface
+  #   networks:
+  #     - jarvis-network
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             device_ids: ['0']
+  #             capabilities: [gpu]
+  #   command: [
+  #     "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
+  #     "--max-model-len", "${VLLM_MAX_MODEL_LEN:-4096}",
+  #     "--gpu-memory-utilization", "${VLLM_GPU_MEMORY:-0.9}",
+  #     "--quantization", "${VLLM_QUANTIZATION:-awq}",
+  #     "--dtype", "auto",
+  #     "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
+  #     "--host", "0.0.0.0",
+  #     "--port", "8000"
+  #   ]
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: jarvis-vllm
     environment:
       <<: *common-variables
-      OLLAMA_KEEP_ALIVE: "24h"
-      OLLAMA_HOST: "0.0.0.0"
-      OLLAMA_MODELS: /models
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
+      # Add memory optimization env vars
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      CUDA_VISIBLE_DEVICES: "0"
     ports:
-      - "11434:11434"
+      - "8080:8000"
     volumes:
-      - /mnt/appsdata/jarvis/models/ollama:/models
-      - /mnt/appsdata/jarvis/scripts:/scripts:ro
+      - /mnt/appsdata/jarvis/models/vllm:/root/.cache/huggingface
     networks:
       - jarvis-network
-    # GPU Configuration for Arch
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0']  # or 'all' for all GPUs
+              device_ids: ['0']
               capabilities: [gpu]
+    command: [
+      "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
+      "--max-model-len", "2048",  # REDUCED from 4096
+      "--gpu-memory-utilization", "0.8",  # REDUCED from 0.9
+      "--quantization", "awq_marlin",  # CHANGED to awq_marlin for better performance
+      "--dtype", "auto",
+      "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--enforce-eager"  # ADDED to disable CUDA graphs (saves memory)
+    ]
     restart: unless-stopped
-
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
   # ============= JARVIS Services =============
   
   llm-service:
     image: felix971/jarvis-llm:v1.0.0
     container_name: jarvis-llm
-    # Add GPU support
     deploy:
       resources:
         reservations:
@@ -108,12 +156,13 @@ services:
               capabilities: [gpu]
     environment:
       <<: *common-variables
-      OLLAMA_HOST: ollama
+      VLLM_HOST: vllm
+      VLLM_PORT: 8000
+      VLLM_API_KEY: ${VLLM_API_KEY:-jarvis-key-123}
       REDIS_HOST: redis
-      MODEL_NAME: ${LLM_MODEL:-mixtral:8x7b-instruct-v0.1-q4_K_M}
+      MODEL_NAME: ${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}
       CUDA_VISIBLE_DEVICES: "0"
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
-      # Add these for better GPU usage
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
@@ -124,14 +173,13 @@ services:
     networks:
       - jarvis-network
     depends_on:
-      - ollama
+      - vllm
       - redis
     restart: unless-stopped
 
   rag-service:
     image: felix971/jarvis-rag:v1.0.0
     container_name: jarvis-rag
-    # Add GPU support for embeddings
     deploy:
       resources:
         reservations:
@@ -149,7 +197,6 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
       TRANSFORMERS_CACHE: /models/transformers
-      # Add these for better GPU usage
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
@@ -169,7 +216,6 @@ services:
   voice-service:
     image: felix971/jarvis-voice:v1.0.0
     container_name: jarvis-voice
-    # Add GPU support for Whisper and TTS
     deploy:
       resources:
         reservations:
@@ -185,7 +231,6 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
       WHISPER_CACHE: /models/whisper
       TTS_CACHE: /models/tts
-      # Add these for better GPU usage
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
@@ -207,10 +252,13 @@ services:
       LLM_SERVICE_URL: http://llm-service:8001
       RAG_SERVICE_URL: http://rag-service:8002
       VOICE_SERVICE_URL: http://voice-service:8003
+      VLLM_URL: http://vllm:8000
+      VLLM_API_KEY: ${VLLM_API_KEY:-jarvis-key-123}
       REDIS_HOST: redis
       POSTGRES_HOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-jarvis}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
+      MODEL_NAME: ${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}
     ports:
       - "8000:8000"
     volumes:
