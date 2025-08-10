@@ -1,4 +1,4 @@
-# services/orchestrator/app.py
+# services/orchestrator/app.py - Fixed WebSocket and Streaming Issues
 from fastapi import FastAPI, WebSocket, HTTPException, Query, File, UploadFile, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
@@ -12,11 +12,12 @@ from datetime import datetime
 import logging
 import os
 import traceback
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="JARVIS Orchestrator", version="1.0.0")
+app = FastAPI(title="JARVIS Orchestrator", version="2.0.0")
 
 # Enable CORS for all origins
 app.add_middleware(
@@ -34,7 +35,7 @@ VOICE_SERVICE = os.getenv('VOICE_SERVICE_URL', 'http://voice-service:8003')
 VLLM_URL = os.getenv('VLLM_URL', 'http://vllm:8000')
 VLLM_API_KEY = os.getenv('VLLM_API_KEY', 'jarvis-key-123')
 
-# Redis connection
+# Redis connection with error handling
 try:
     redis_client = redis.Redis(
         host=os.getenv('REDIS_HOST', 'redis'),
@@ -58,8 +59,11 @@ class SessionManager:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.context = []
+        self.message_count = 0
     
     async def process_message(self, message: str, use_rag: bool = True) -> AsyncGenerator[str, None]:
+        """Process a message and yield response chunks"""
+        self.message_count += 1
         context_docs = []
         
         # RAG search if enabled
@@ -68,16 +72,19 @@ class SessionManager:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.post(
                         f"{RAG_SERVICE}/search",
-                        json={"query": message, "top_k": 3}
+                        json={
+                            "query": message,
+                            "collection": "documents",
+                            "top_k": 3,
+                            "threshold": 0.5
+                        }
                     )
                     if response.status_code == 200:
                         result = response.json()
                         context_docs = result.get("results", [])
                         logger.info(f"RAG search returned {len(context_docs)} results")
-            except httpx.HTTPStatusError as e:
-                logger.error(f"RAG service error: {e.response.text}")
             except httpx.ConnectError:
-                logger.warning("RAG service unavailable")
+                logger.warning("RAG service unavailable - proceeding without context")
             except Exception as e:
                 logger.error(f"RAG error: {e}")
         
@@ -85,6 +92,7 @@ class SessionManager:
         prompt = self._build_prompt(message, context_docs)
         
         # Stream response from LLM
+        full_response = ""
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream(
@@ -102,69 +110,117 @@ class SessionManager:
                     
                     async for line in response.aiter_lines():
                         if line:
+                            full_response += line
                             yield line
+                            
         except httpx.ConnectError:
-            yield "Error: Cannot connect to LLM service. Please ensure all services are running."
+            error_msg = "Error: Cannot connect to LLM service. Please ensure all services are running."
+            logger.error(error_msg)
+            yield error_msg
         except httpx.TimeoutException:
-            yield "Error: Request timed out. The model might be loading or overwhelmed."
+            error_msg = "Error: Request timed out. The model might be loading or overwhelmed."
+            logger.error(error_msg)
+            yield error_msg
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
             yield f"Error: {str(e)}"
         
-        # Store context for history
-        self.context.append({
-            "timestamp": datetime.now().isoformat(),
-            "user": message,
-            "context_used": len(context_docs) > 0
-        })
-        
-        # Update Redis if available
-        if redis_client:
+        # Store conversation in Redis
+        if redis_client and full_response:
             try:
-                redis_client.setex(
-                    f"session:{self.session_id}:context",
-                    3600,
-                    json.dumps(self.context[-10:])
-                )
+                conversation_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "user": message,
+                    "assistant": full_response,
+                    "context_used": len(context_docs) > 0,
+                    "session_id": self.session_id
+                }
+                
+                # Store in Redis
+                key = f"conversation:{self.session_id}:{self.message_count}"
+                redis_client.setex(key, 3600, json.dumps(conversation_data))
+                
+                # Update session info
+                session_key = f"session:{self.session_id}"
+                session_data = {
+                    "last_activity": datetime.now().isoformat(),
+                    "message_count": self.message_count,
+                    "last_message": message[:100]
+                }
+                redis_client.setex(session_key, 3600, json.dumps(session_data))
+                
             except Exception as e:
-                logger.error(f"Redis setex error: {e}")
+                logger.error(f"Redis storage error: {e}")
     
     def _build_prompt(self, message: str, context_docs: List[Dict]) -> str:
+        """Build prompt with RAG context"""
         prompt_parts = []
         
         if context_docs:
-            prompt_parts.append("Relevant information from knowledge base:")
-            for doc in context_docs[:3]:
+            prompt_parts.append("Based on the following relevant information:")
+            prompt_parts.append("")
+            
+            for i, doc in enumerate(context_docs[:3], 1):
                 text = doc.get('text', '')[:500]
                 source = doc.get('source', 'unknown')
-                prompt_parts.append(f"- From {source}: {text}")
+                score = doc.get('score', 0)
+                prompt_parts.append(f"[{i}] From {source} (relevance: {score:.2f}):")
+                prompt_parts.append(text)
+                prompt_parts.append("")
+            
+            prompt_parts.append("---")
             prompt_parts.append("")
         
-        prompt_parts.append(f"User message: {message}")
+        prompt_parts.append(f"User question: {message}")
+        prompt_parts.append("")
+        prompt_parts.append("Please provide a helpful and accurate response.")
         
         return "\n".join(prompt_parts)
 
-# Session storage
-sessions: Dict[str, SessionManager] = {}
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.sessions: Dict[str, SessionManager] = {}
+    
+    async def connect(self, websocket: WebSocket, session_id: str):
+        await websocket.accept()
+        self.active_connections[session_id] = websocket
+        self.sessions[session_id] = SessionManager(session_id)
+        logger.info(f"WebSocket connected: {session_id}")
+    
+    def disconnect(self, session_id: str):
+        if session_id in self.active_connections:
+            del self.active_connections[session_id]
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+        logger.info(f"WebSocket disconnected: {session_id}")
+    
+    async def send_message(self, session_id: str, message: dict):
+        if session_id in self.active_connections:
+            await self.active_connections[session_id].send_json(message)
+    
+    async def send_text(self, session_id: str, text: str):
+        if session_id in self.active_connections:
+            await self.active_connections[session_id].send_text(text)
+
+manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    
+    """WebSocket endpoint for real-time chat"""
     session_id = str(uuid.uuid4())
-    session = SessionManager(session_id)
-    sessions[session_id] = session
-    
-    logger.info(f"WebSocket connection established: {session_id}")
+    await manager.connect(websocket, session_id)
     
     try:
         # Send initial connection message
-        await websocket.send_json({
+        await manager.send_message(session_id, {
             "type": "connection",
             "session_id": session_id,
-            "message": "JARVIS online. How can I assist you?"
+            "message": "Connected to JARVIS. How can I assist you?"
         })
         
+        # Keep connection alive and handle messages
         while True:
             try:
                 # Receive message with timeout
@@ -173,33 +229,41 @@ async def websocket_endpoint(websocket: WebSocket):
                     timeout=300.0  # 5 minute timeout
                 )
                 
+                # Handle different message types
                 if data.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
+                    await manager.send_message(session_id, {"type": "pong"})
                     continue
                 
-                if data.get("type") == "text":
+                elif data.get("type") == "text":
                     message = data.get("message", "")
                     use_rag = data.get("use_rag", True)
                     
                     if not message:
-                        await websocket.send_json({
+                        await manager.send_message(session_id, {
                             "type": "error",
                             "message": "Empty message received"
                         })
                         continue
                     
-                    logger.info(f"Processing message: {message[:50]}...")
+                    logger.info(f"Processing message from {session_id}: {message[:50]}...")
                     
-                    # Stream the response
+                    # Get session manager
+                    session_manager = manager.sessions.get(session_id)
+                    if not session_manager:
+                        session_manager = SessionManager(session_id)
+                        manager.sessions[session_id] = session_manager
+                    
+                    # Stream response
                     try:
-                        async for chunk in session.process_message(message, use_rag):
-                            await websocket.send_text(chunk)
+                        async for chunk in session_manager.process_message(message, use_rag):
+                            await manager.send_text(session_id, chunk)
                         
                         # Send completion signal
-                        await websocket.send_json({"type": "complete"})
+                        await manager.send_message(session_id, {"type": "complete"})
+                        
                     except Exception as e:
                         logger.error(f"Error processing message: {e}")
-                        await websocket.send_json({
+                        await manager.send_message(session_id, {
                             "type": "error",
                             "message": f"Error processing request: {str(e)}"
                         })
@@ -207,49 +271,62 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif data.get("type") == "voice":
                     # Handle voice input
                     try:
-                        async with httpx.AsyncClient() as client:
+                        audio_data = data.get("audio")
+                        
+                        # Send to voice service for transcription
+                        async with httpx.AsyncClient(timeout=30.0) as client:
                             response = await client.post(
                                 f"{VOICE_SERVICE}/transcribe",
-                                files={"audio": data["audio"]}
+                                files={"audio": audio_data}
                             )
                             transcription = response.json()["text"]
                         
-                        await websocket.send_json({
+                        await manager.send_message(session_id, {
                             "type": "transcription",
                             "text": transcription
                         })
                         
                         # Process the transcribed text
-                        async for chunk in session.process_message(transcription):
-                            await websocket.send_text(chunk)
+                        session_manager = manager.sessions.get(session_id)
+                        if not session_manager:
+                            session_manager = SessionManager(session_id)
+                            manager.sessions[session_id] = session_manager
                         
-                        await websocket.send_json({"type": "complete"})
+                        async for chunk in session_manager.process_message(transcription):
+                            await manager.send_text(session_id, chunk)
+                        
+                        await manager.send_message(session_id, {"type": "complete"})
+                        
                     except Exception as e:
                         logger.error(f"Voice processing error: {e}")
-                        await websocket.send_json({
+                        await manager.send_message(session_id, {
                             "type": "error",
                             "message": f"Voice processing error: {str(e)}"
                         })
-                        
+                
             except asyncio.TimeoutError:
                 logger.info(f"WebSocket timeout for session {session_id}")
-                await websocket.send_json({
+                await manager.send_message(session_id, {
                     "type": "timeout",
                     "message": "Connection timeout due to inactivity"
                 })
                 break
+                
             except WebSocketDisconnect:
                 logger.info(f"WebSocket disconnected: {session_id}")
                 break
+                
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON received: {e}")
-                await websocket.send_json({
+                await manager.send_message(session_id, {
                     "type": "error",
                     "message": "Invalid message format"
                 })
+                
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
-                await websocket.send_json({
+                logger.error(traceback.format_exc())
+                await manager.send_message(session_id, {
                     "type": "error",
                     "message": f"Server error: {str(e)}"
                 })
@@ -258,40 +335,49 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket fatal error: {traceback.format_exc()}")
     finally:
-        # Cleanup
-        if session_id in sessions:
-            del sessions[session_id]
-        logger.info(f"WebSocket closed: {session_id}")
-        try:
-            await websocket.close()
-        except:
-            pass
+        manager.disconnect(session_id)
 
 @app.post("/chat")
-async def chat_endpoint(message: str = Query(...), session_id: Optional[str] = None):
+async def chat_endpoint(
+    message: str = Query(..., description="User message"),
+    session_id: Optional[str] = Query(None, description="Session ID"),
+    use_rag: bool = Query(True, description="Use RAG for context")
+):
+    """REST API endpoint for chat"""
     if not session_id:
         session_id = str(uuid.uuid4())
     
-    if session_id not in sessions:
-        sessions[session_id] = SessionManager(session_id)
+    # Get or create session
+    if session_id not in manager.sessions:
+        manager.sessions[session_id] = SessionManager(session_id)
     
-    session = sessions[session_id]
+    session = manager.sessions[session_id]
     
+    # Collect response
     response_chunks = []
-    async for chunk in session.process_message(message):
+    async for chunk in session.process_message(message, use_rag):
         response_chunks.append(chunk)
     
     response = "".join(response_chunks)
     
     return {
         "session_id": session_id,
-        "response": response
+        "response": response,
+        "message": message,
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/health")
 async def health_check():
-    health_status = {}
+    """Health check endpoint"""
+    health_status = {
+        "status": "healthy",
+        "services": {},
+        "active_sessions": len(manager.sessions),
+        "active_websockets": len(manager.active_connections)
+    }
     
+    # Check service health
     services = {
         "llm": f"{LLM_SERVICE}/health",
         "rag": f"{RAG_SERVICE}/health",
@@ -302,20 +388,22 @@ async def health_check():
         for name, url in services.items():
             try:
                 response = await client.get(url)
-                health_status[name] = response.json()
+                health_status["services"][name] = response.json()
             except Exception as e:
                 logger.error(f"Health check for {name} failed: {e}")
-                health_status[name] = {"status": "unhealthy", "error": str(e)}
+                health_status["services"][name] = {"status": "unhealthy", "error": str(e)}
+                health_status["status"] = "degraded"
     
     # Check Redis
     try:
         if redis_client:
             redis_client.ping()
-            health_status["redis"] = {"status": "healthy"}
+            health_status["services"]["redis"] = {"status": "healthy"}
         else:
-            health_status["redis"] = {"status": "not configured"}
+            health_status["services"]["redis"] = {"status": "not configured"}
     except Exception as e:
-        health_status["redis"] = {"status": "unhealthy", "error": str(e)}
+        health_status["services"]["redis"] = {"status": "unhealthy", "error": str(e)}
+        health_status["status"] = "degraded"
     
     # Check vLLM
     try:
@@ -324,192 +412,32 @@ async def health_check():
                 f"{VLLM_URL}/health",
                 headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
             )
-            health_status["vllm"] = {
+            health_status["services"]["vllm"] = {
                 "status": "healthy" if response.status_code == 200 else "unhealthy"
             }
     except Exception as e:
-        health_status["vllm"] = {"status": "unhealthy", "error": str(e)}
+        health_status["services"]["vllm"] = {"status": "unhealthy", "error": str(e)}
+        health_status["status"] = "degraded"
     
-    all_healthy = all(
-        s.get("status") == "healthy" 
-        for s in health_status.values()
-    )
-    
-    return {
-        "status": "healthy" if all_healthy else "degraded",
-        "services": health_status,
-        "active_sessions": len(sessions)
-    }
+    return health_status
 
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
         "service": "JARVIS Orchestrator",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "online",
         "endpoints": {
             "websocket": "/ws",
             "chat": "/chat",
             "health": "/health",
-            "models": {
-                "info": "/api/models/info",
-                "status": "/api/models/status",
-                "config": "/api/models/config",
-                "available": "/api/models/available"
-            },
-            "documents": {
-                "upload": "/api/documents/upload",
-                "search": "/api/documents/search",
-                "list": "/api/documents/list",
-                "stats": "/api/documents/stats"
-            }
-        }
+            "documents": "/api/documents/upload"
+        },
+        "active_sessions": len(manager.sessions)
     }
 
-# ============= MODEL MANAGEMENT API =============
-
-@app.get("/api/models/info")
-async def get_vllm_model_info():
-    """Get current model info from vLLM"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"{VLLM_URL}/v1/models",
-                headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            current_model = os.getenv('VLLM_MODEL', 'Unknown')
-            data['current_config'] = {
-                'model': current_model,
-                'max_model_len': os.getenv('VLLM_MAX_MODEL_LEN', '4096'),
-                'gpu_memory_utilization': os.getenv('VLLM_GPU_MEMORY', '0.9'),
-                'quantization': os.getenv('VLLM_QUANTIZATION', 'awq')
-            }
-            
-            return data
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Cannot connect to vLLM service")
-    except Exception as e:
-        logger.error(f"Error getting model info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/models/status")
-async def get_model_status():
-    """Get current model status and system info"""
-    try:
-        vllm_healthy = False
-        model_loaded = False
-        current_model = os.getenv('VLLM_MODEL', 'Not configured')
-        
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                health_response = await client.get(
-                    f"{VLLM_URL}/health",
-                    headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
-                )
-                vllm_healthy = health_response.status_code == 200
-                
-                if vllm_healthy:
-                    models_response = await client.get(
-                        f"{VLLM_URL}/v1/models",
-                        headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
-                    )
-                    if models_response.status_code == 200:
-                        models_data = models_response.json()
-                        model_loaded = len(models_data.get("data", [])) > 0
-                        if model_loaded and models_data["data"]:
-                            current_model = models_data["data"][0].get("id", current_model)
-        except Exception as e:
-            logger.error(f"vLLM status check failed: {e}")
-        
-        gpu_enabled = os.path.exists('/dev/nvidia0') or 'CUDA_VISIBLE_DEVICES' in os.environ
-        
-        return {
-            "vllm_healthy": vllm_healthy,
-            "model_loaded": model_loaded,
-            "current_model": current_model,
-            "gpu_enabled": gpu_enabled,
-            "vllm_url": VLLM_URL,
-            "config": {
-                "max_model_len": os.getenv('VLLM_MAX_MODEL_LEN', '4096'),
-                "gpu_memory_utilization": float(os.getenv('VLLM_GPU_MEMORY', '0.9')),
-                "quantization": os.getenv('VLLM_QUANTIZATION', 'awq')
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error getting status: {e}")
-        return {"vllm_healthy": False, "error": str(e)}
-
-@app.get("/api/models/available")
-async def get_available_models():
-    """Get list of recommended models for vLLM"""
-    return {
-        "recommended_12gb": [
-            {
-                "name": "TheBloke/Mistral-7B-Instruct-v0.2-AWQ",
-                "size": "4.2GB",
-                "description": "Excellent general-purpose model, fast inference",
-                "quantization": "AWQ",
-                "max_context": 32768
-            },
-            {
-                "name": "TheBloke/Llama-2-7B-Chat-AWQ",
-                "size": "3.9GB",
-                "description": "Meta's conversational AI, good for chat",
-                "quantization": "AWQ",
-                "max_context": 4096
-            },
-            {
-                "name": "TheBloke/neural-chat-7B-v3-3-AWQ",
-                "size": "4.1GB",
-                "description": "Intel's fine-tuned chat model",
-                "quantization": "AWQ",
-                "max_context": 8192
-            }
-        ],
-        "small_models": [
-            {
-                "name": "microsoft/phi-2",
-                "size": "2.7GB",
-                "description": "Tiny but capable model",
-                "quantization": "none",
-                "max_context": 2048
-            }
-        ]
-    }
-
-@app.post("/api/models/config")
-async def update_model_config(
-    model: str = Query(..., description="Model name/path"),
-    max_model_len: int = Query(4096, description="Maximum model length"),
-    gpu_memory: float = Query(0.9, description="GPU memory utilization (0-1)")
-):
-    """Update vLLM configuration (requires container restart)"""
-    try:
-        os.environ['VLLM_MODEL'] = model
-        os.environ['VLLM_MAX_MODEL_LEN'] = str(max_model_len)
-        os.environ['VLLM_GPU_MEMORY'] = str(gpu_memory)
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "message": "Configuration updated. Please restart vLLM container to apply changes.",
-                "config": {
-                    "model": model,
-                    "max_model_len": max_model_len,
-                    "gpu_memory": gpu_memory
-                },
-                "restart_command": "docker-compose restart vllm llm-service"
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error updating config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============= DOCUMENT/RAG MANAGEMENT API =============
+# ============= Document Management API =============
 
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
@@ -522,10 +450,11 @@ async def upload_document(file: UploadFile = File(...)):
             
             result = response.json()
             
+            # Store document info in Redis
             if redis_client and result.get("status") == "success":
                 doc_info = {
-                    "id": str(uuid.uuid4()),
-                    "name": file.filename,
+                    "id": result.get("document_id"),
+                    "filename": file.filename,
                     "chunks": result.get("chunks_created", 0),
                     "uploaded": datetime.now().isoformat(),
                     "collection": result.get("collection", "documents")
@@ -533,9 +462,9 @@ async def upload_document(file: UploadFile = File(...)):
                 
                 redis_client.lpush("jarvis:documents", json.dumps(doc_info))
                 redis_client.ltrim("jarvis:documents", 0, 99)
-                result["document_id"] = doc_info["id"]
             
             return result
+            
     except httpx.HTTPStatusError as e:
         logger.error(f"RAG service error during upload: {e}")
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
@@ -568,60 +497,17 @@ async def search_documents(
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/documents/list")
-async def list_documents():
-    """Get list of indexed documents"""
+@app.get("/api/collections")
+async def list_collections():
+    """List available collections from RAG service"""
     try:
-        if not redis_client:
-            return {"documents": [], "message": "Redis not available"}
-        
-        doc_list = redis_client.lrange("jarvis:documents", 0, -1)
-        documents = []
-        
-        for doc_json in doc_list:
-            try:
-                doc = json.loads(doc_json)
-                documents.append(doc)
-            except json.JSONDecodeError:
-                continue
-        
-        return {"documents": documents, "total": len(documents)}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{RAG_SERVICE}/collections")
+            response.raise_for_status()
+            return response.json()
     except Exception as e:
-        logger.error(f"Error listing documents: {e}")
-        return {"documents": [], "error": str(e)}
-
-@app.get("/api/documents/stats")
-async def get_document_stats():
-    """Get RAG system statistics"""
-    try:
-        stats = {
-            "rag_service": "unknown",
-            "qdrant": "unknown",
-            "total_documents": 0,
-            "total_chunks": 0
-        }
-        
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{RAG_SERVICE}/health")
-                if response.status_code == 200:
-                    stats["rag_service"] = "healthy"
-                    health_data = response.json()
-                    stats.update(health_data)
-        except Exception:
-            stats["rag_service"] = "unhealthy"
-        
-        if redis_client:
-            try:
-                doc_count = redis_client.llen("jarvis:documents")
-                stats["total_documents"] = doc_count
-            except Exception:
-                pass
-        
-        return stats
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return {"error": str(e)}
+        logger.error(f"Error listing collections: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Error handlers
 @app.exception_handler(httpx.ConnectError)

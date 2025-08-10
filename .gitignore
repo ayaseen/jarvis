@@ -4,7 +4,7 @@ redis/
 qdrant/
 grafana/
 prometheus/
-
+milvus/
 # Model directories (too large for git)
 models/
 
