@@ -76,7 +76,7 @@ services:
         reservations:
           memory: 256M
 
-  # ============= Milvus Vector Database - CPU ONLY =============
+  # ============= Milvus Vector Database - CPU ONLY (FROM OFFICIAL) =============
   
   etcd:
     container_name: milvus-etcd
@@ -102,7 +102,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
 
   minio:
     container_name: milvus-minio
@@ -129,11 +129,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
 
   milvus:
     container_name: milvus-standalone
-    image: milvusdb/milvus:v2.6.0  # CPU version, NOT GPU
+    image: milvusdb/milvus:v2.6.0
     command: ["milvus", "run", "standalone"]
     hostname: milvus
     security_opt:
@@ -154,12 +154,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
         reservations:
-          memory: 512M
-    depends_on:
-      - etcd
-      - minio
+          memory: 1G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -167,8 +164,12 @@ services:
       timeout: 20s
       retries: 3
     restart: unless-stopped
+    depends_on:
+      - etcd
+      - minio
 
-  # ============= vLLM Service - OPTIMIZED FOR 12GB GPU =============
+
+  # ============= vLLM Service - 50% GPU (6GB) =============
   vllm:
     image: vllm/vllm-openai:latest
     container_name: jarvis-vllm
@@ -176,7 +177,7 @@ services:
     environment:
       <<: *common-variables
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:256"
       CUDA_VISIBLE_DEVICES: "0"
       VLLM_USAGE_SOURCE: docker
       VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -191,7 +192,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 6G
+          memory: 8G
         reservations:
           devices:
             - driver: nvidia
@@ -200,15 +201,15 @@ services:
     command: [
       "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
       "--max-model-len", "2048",
-      "--gpu-memory-utilization", "0.5",  # Conservative for 12GB GPU
+      "--gpu-memory-utilization", "0.5",  # 50% = 6GB
       "--quantization", "awq",
       "--dtype", "half",
       "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
       "--host", "0.0.0.0",
       "--port", "8000",
       "--enforce-eager",
-      "--max-num-batched-tokens", "1024",
-      "--max-num-seqs", "2"  # Very conservative
+      "--max-num-batched-tokens", "2048",
+      "--max-num-seqs", "4"
     ]
     restart: unless-stopped
     healthcheck:
@@ -264,9 +265,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G  # Minimal memory
+          memory: 3G
         reservations:
-          memory: 512M
+          memory: 2G
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
     environment:
       <<: *common-variables
       MILVUS_HOST: milvus
@@ -275,9 +280,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-jarvis}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_USE_GPU: ${EMBEDDING_USE_GPU:-true}
       TRANSFORMERS_CACHE: /models/transformers
-      # Force CPU for embeddings to save GPU memory
-      CUDA_VISIBLE_DEVICES: ""
+      CUDA_VISIBLE_DEVICES: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8002:8002"
     volumes:
@@ -307,16 +315,24 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G  # Minimal memory
+          memory: 3G
         reservations:
-          memory: 512M
+          memory: 2G
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
     environment:
       <<: *common-variables
-      WHISPER_MODEL: ${WHISPER_MODEL:-tiny.en}  # Smallest model
+      WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
       TTS_MODEL: ${TTS_MODEL:-tts_models/en/ljspeech/tacotron2-DDC}
-      FORCE_CPU: "true"  # Force CPU to save GPU
+      FORCE_CPU: ${VOICE_FORCE_CPU:-false}
+      CUDA_VISIBLE_DEVICES: "0"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
       WHISPER_CACHE: /models/whisper
       TTS_CACHE: /models/tts
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8003:8003"
     volumes:

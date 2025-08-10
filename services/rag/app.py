@@ -355,24 +355,33 @@ class MilvusManager:
 
 class RAGEngine:
     def __init__(self):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Check if GPU should be used based on environment
+        use_gpu = os.getenv('EMBEDDING_USE_GPU', 'true').lower() == 'true'
         
-        # Force CPU if GPU memory is low
-        if self.device == 'cuda':
+        if use_gpu and torch.cuda.is_available():
+            # Check GPU memory before using it
             free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
-            if free_memory < 2e9:  # Less than 2GB free
-                logger.warning("Low GPU memory, using CPU for embeddings")
+            if free_memory > 1e9:  # At least 1GB free
+                self.device = 'cuda'
+                logger.info(f"Using GPU for embeddings (free memory: {free_memory/1e9:.2f}GB)")
+            else:
                 self.device = 'cpu'
-        
-        logger.info(f"Using device: {self.device}")
+                logger.warning(f"Low GPU memory ({free_memory/1e9:.2f}GB), using CPU for embeddings")
+        else:
+            self.device = 'cpu'
+            logger.info("Using CPU for embeddings (GPU disabled or not available)")
         
         # Set cache directory
         os.environ['TRANSFORMERS_CACHE'] = TRANSFORMERS_CACHE
         os.environ['HF_HOME'] = TRANSFORMERS_CACHE
         os.environ['SENTENCE_TRANSFORMERS_HOME'] = TRANSFORMERS_CACHE
         
-        # Initialize embedding model and get actual dimension
-        self.embedding_dim = EMBEDDING_DIM
+        # Declare global BEFORE any usage
+        global EMBEDDING_DIM
+        
+        # Initialize embedding dimension
+        self.embedding_dim = MODEL_DIMENSIONS.get(EMBEDDING_MODEL, 384)
+        
         try:
             self.embedder = SentenceTransformer(
                 EMBEDDING_MODEL,
@@ -382,15 +391,15 @@ class RAGEngine:
             
             # Get actual embedding dimension
             test_embedding = self.embedder.encode("test")
-            self.embedding_dim = len(test_embedding)
+            actual_dim = len(test_embedding)
+            self.embedding_dim = actual_dim
             
-            logger.info(f"Loaded embedding model: {EMBEDDING_MODEL} (dim={self.embedding_dim})")
+            # Update global if different
+            if actual_dim != EMBEDDING_DIM:
+                logger.info(f"Updating EMBEDDING_DIM from {EMBEDDING_DIM} to {actual_dim}")
+                EMBEDDING_DIM = actual_dim
             
-            # Update global variable if needed
-            global EMBEDDING_DIM
-            if self.embedding_dim != EMBEDDING_DIM:
-                EMBEDDING_DIM = self.embedding_dim
-                logger.info(f"Updated global EMBEDDING_DIM to {EMBEDDING_DIM}")
+            logger.info(f"Loaded embedding model: {EMBEDDING_MODEL} on {self.device} (dim={self.embedding_dim})")
             
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")

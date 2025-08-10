@@ -57,7 +57,6 @@ for service in "${services[@]}"; do
     # Build the image with private registry tag
     if docker build \
         --no-cache \
-        -t "$REGISTRY/$REGISTRY_NAMESPACE/$service:$VERSION" \
         -t "$REGISTRY/$REGISTRY_NAMESPACE/$service:latest" \
         "./services/$service"; then
         
@@ -66,7 +65,6 @@ for service in "${services[@]}"; do
         echo -e "${YELLOW}📤 Pushing $service to $REGISTRY...${NC}"
         
         # Push both version tag and latest tag
-        docker push "$REGISTRY/$REGISTRY_NAMESPACE/$service:$VERSION"
         docker push "$REGISTRY/$REGISTRY_NAMESPACE/$service:latest"
         
         echo -e "${GREEN}✅ $service complete!${NC}"
@@ -79,7 +77,7 @@ for service in "${services[@]}"; do
 done
 
 # Logout for security
-docker logout $REGISTRY
+#docker logout $REGISTRY
 echo -e "${YELLOW}🔒 Logged out from $REGISTRY${NC}"
 
 echo ""
