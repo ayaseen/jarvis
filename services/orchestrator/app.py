@@ -42,12 +42,7 @@ try:
         port=6379,
         decode_responses=True,
         socket_connect_timeout=5,
-        socket_keepalive=True,
-        socket_keepalive_options={
-            1: 1,  # TCP_KEEPIDLE
-            2: 3,  # TCP_KEEPINTVAL  
-            3: 5   # TCP_KEEPCNT
-        }
+        retry_on_timeout=True
     )
     redis_client.ping()
     logger.info("Connected to Redis successfully")
