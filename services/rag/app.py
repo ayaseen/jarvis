@@ -1,4 +1,4 @@
-# services/rag/app.py - Complete Milvus Integration
+# services/rag/app.py - FIXED FOR MILVUS
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -37,7 +37,7 @@ MILVUS_PORT = int(os.getenv('MILVUS_PORT', '19530'))
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
 TRANSFORMERS_CACHE = os.getenv('TRANSFORMERS_CACHE', '/models/transformers')
 
-# Model dimensions
+# Model dimensions - MUTABLE GLOBAL
 MODEL_DIMENSIONS = {
     'sentence-transformers/all-MiniLM-L6-v2': 384,
     'sentence-transformers/all-MiniLM-L12-v2': 384,
@@ -46,7 +46,8 @@ MODEL_DIMENSIONS = {
     'BAAI/bge-small-en-v1.5': 384,
 }
 
-EMBEDDING_DIM = MODEL_DIMENSIONS.get(EMBEDDING_MODEL, 384)
+# This will be updated dynamically based on actual model
+EMBEDDING_DIM = 384
 
 class RAGRequest(BaseModel):
     query: str
@@ -55,10 +56,11 @@ class RAGRequest(BaseModel):
     threshold: float = 0.5
 
 class MilvusManager:
-    def __init__(self):
+    def __init__(self, embedding_dim: int):
         self.connected = False
         self.collections = {}
         self.connection_alias = "default"
+        self.embedding_dim = embedding_dim
         
     async def connect(self, max_retries: int = 30) -> bool:
         """Connect to Milvus with retry logic"""
@@ -115,7 +117,7 @@ class MilvusManager:
                         FieldSchema(
                             name="embedding",
                             dtype=DataType.FLOAT_VECTOR,
-                            dim=EMBEDDING_DIM,
+                            dim=self.embedding_dim,
                             description="Text embedding vector"
                         ),
                         FieldSchema(
@@ -354,15 +356,23 @@ class MilvusManager:
 class RAGEngine:
     def __init__(self):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Force CPU if GPU memory is low
+        if self.device == 'cuda':
+            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+            if free_memory < 2e9:  # Less than 2GB free
+                logger.warning("Low GPU memory, using CPU for embeddings")
+                self.device = 'cpu'
+        
         logger.info(f"Using device: {self.device}")
-        logger.info(f"Using embedding model: {EMBEDDING_MODEL} with dimension: {EMBEDDING_DIM}")
         
         # Set cache directory
         os.environ['TRANSFORMERS_CACHE'] = TRANSFORMERS_CACHE
         os.environ['HF_HOME'] = TRANSFORMERS_CACHE
         os.environ['SENTENCE_TRANSFORMERS_HOME'] = TRANSFORMERS_CACHE
         
-        # Initialize embedding model
+        # Initialize embedding model and get actual dimension
+        self.embedding_dim = EMBEDDING_DIM
         try:
             self.embedder = SentenceTransformer(
                 EMBEDDING_MODEL,
@@ -370,22 +380,22 @@ class RAGEngine:
                 cache_folder=TRANSFORMERS_CACHE
             )
             
-            # Verify embedding dimension
+            # Get actual embedding dimension
             test_embedding = self.embedder.encode("test")
-            actual_dim = len(test_embedding)
-            if actual_dim != EMBEDDING_DIM:
-                logger.warning(f"Model dimension mismatch! Expected {EMBEDDING_DIM}, got {actual_dim}")
-                # Update the dimension
-                global EMBEDDING_DIM
-                EMBEDDING_DIM = actual_dim
+            self.embedding_dim = len(test_embedding)
             
-            logger.info(f"Loaded embedding model: {EMBEDDING_MODEL} (dim={actual_dim})")
+            logger.info(f"Loaded embedding model: {EMBEDDING_MODEL} (dim={self.embedding_dim})")
+            
+            # Update global variable
+            global EMBEDDING_DIM
+            EMBEDDING_DIM = self.embedding_dim
+            
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise
         
-        # Initialize Milvus manager
-        self.milvus = MilvusManager()
+        # Initialize Milvus manager with actual dimension
+        self.milvus = MilvusManager(self.embedding_dim)
     
     async def connect(self) -> bool:
         """Connect to Milvus"""
@@ -590,6 +600,7 @@ async def health_check():
     
     if engine:
         health_info["device"] = engine.device
+        health_info["embedding_dim"] = engine.embedding_dim
         
         # Try to reconnect if not connected
         if not engine.milvus.connected:
@@ -722,7 +733,7 @@ async def root():
         "vector_db": "Milvus",
         "status": "online",
         "embedding_model": EMBEDDING_MODEL,
-        "embedding_dimension": EMBEDDING_DIM,
+        "embedding_dimension": EMBEDDING_DIM if engine else MODEL_DIMENSIONS.get(EMBEDDING_MODEL, 384),
         "milvus_endpoint": f"{MILVUS_HOST}:{MILVUS_PORT}",
         "device": engine.device if engine else "unknown",
         "endpoints": {

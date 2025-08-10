@@ -45,7 +45,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1G
         reservations:
           memory: 512M
 
@@ -54,7 +54,7 @@ services:
     container_name: jarvis-redis
     hostname: redis
     user: "999:${PGID:-1002}"
-    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru --dir /data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru --dir /data
     ports:
       - "6379:6379"
     volumes:
@@ -72,11 +72,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 512M
         reservations:
           memory: 256M
 
-  # ============= Milvus Vector Database with GPU =============
+  # ============= Milvus Vector Database - CPU ONLY =============
   
   etcd:
     container_name: milvus-etcd
@@ -102,8 +102,6 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
-        reservations:
           memory: 256M
 
   minio:
@@ -131,13 +129,11 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
-        reservations:
-          memory: 512M
+          memory: 256M
 
   milvus:
     container_name: milvus-standalone
-    image: milvusdb/milvus:v2.6.0-gpu
+    image: milvusdb/milvus:v2.6.0  # CPU version, NOT GPU
     command: ["milvus", "run", "standalone"]
     hostname: milvus
     security_opt:
@@ -158,13 +154,9 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 1G
         reservations:
-          devices:
-            - driver: nvidia
-              capabilities: ["gpu"]
-              device_ids: ["0"]
-          memory: 2G
+          memory: 512M
     depends_on:
       - etcd
       - minio
@@ -176,7 +168,7 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # ============= vLLM Service with Memory Optimization =============
+  # ============= vLLM Service - OPTIMIZED FOR 12GB GPU =============
   vllm:
     image: vllm/vllm-openai:latest
     container_name: jarvis-vllm
@@ -184,7 +176,7 @@ services:
     environment:
       <<: *common-variables
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:512"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
       CUDA_VISIBLE_DEVICES: "0"
       VLLM_USAGE_SOURCE: docker
       VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -199,7 +191,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 10G
+          memory: 6G
         reservations:
           devices:
             - driver: nvidia
@@ -208,15 +200,15 @@ services:
     command: [
       "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
       "--max-model-len", "2048",
-      "--gpu-memory-utilization", "0.75",
+      "--gpu-memory-utilization", "0.5",  # Conservative for 12GB GPU
       "--quantization", "awq",
       "--dtype", "half",
       "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
       "--host", "0.0.0.0",
       "--port", "8000",
       "--enforce-eager",
-      "--max-num-batched-tokens", "2048",
-      "--max-num-seqs", "8"
+      "--max-num-batched-tokens", "1024",
+      "--max-num-seqs", "2"  # Very conservative
     ]
     restart: unless-stopped
     healthcheck:
@@ -224,9 +216,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s
+      start_period: 120s
 
-  # ============= JARVIS Services with Private Registry =============
+  # ============= JARVIS Services =============
   
   llm-service:
     image: hub.rhlab.dev/jarvis/llm:latest
@@ -235,7 +227,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1G
         reservations:
           memory: 512M
     environment:
@@ -263,7 +255,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 40s
+      start_period: 60s
 
   rag-service:
     image: hub.rhlab.dev/jarvis/rag:latest
@@ -272,26 +264,20 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 1G  # Minimal memory
         reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']
-              capabilities: [gpu]
+          memory: 512M
     environment:
       <<: *common-variables
-      # CHANGED FROM QDRANT TO MILVUS
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       POSTGRES_HOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-jarvis}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-      CUDA_VISIBLE_DEVICES: "0"
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
       TRANSFORMERS_CACHE: /models/transformers
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Force CPU for embeddings to save GPU memory
+      CUDA_VISIBLE_DEVICES: ""
     ports:
       - "8002:8002"
     volumes:
@@ -304,7 +290,7 @@ services:
         aliases:
           - rag-service
     depends_on:
-      - milvus  # CHANGED FROM qdrant
+      - milvus
       - postgres
     restart: unless-stopped
     healthcheck:
@@ -312,7 +298,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 40s
+      start_period: 60s
 
   voice-service:
     image: hub.rhlab.dev/jarvis/voice:latest
@@ -321,23 +307,16 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3G
+          memory: 1G  # Minimal memory
         reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']
-              capabilities: [gpu]
+          memory: 512M
     environment:
       <<: *common-variables
-      WHISPER_MODEL: ${WHISPER_MODEL:-tiny.en}
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny.en}  # Smallest model
       TTS_MODEL: ${TTS_MODEL:-tts_models/en/ljspeech/tacotron2-DDC}
-      FORCE_CPU: ${VOICE_FORCE_CPU:-false}
-      CUDA_VISIBLE_DEVICES: "0"
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
+      FORCE_CPU: "true"  # Force CPU to save GPU
       WHISPER_CACHE: /models/whisper
       TTS_CACHE: /models/tts
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8003:8003"
     volumes:
@@ -364,7 +343,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1G
         reservations:
           memory: 512M
     environment:
@@ -398,7 +377,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 40s
+      start_period: 60s
 
   web:
     image: hub.rhlab.dev/jarvis/web:latest
@@ -407,7 +386,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
         reservations:
           memory: 128M
     environment:
@@ -428,52 +407,3 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-
-  # ============= Optional Monitoring Services =============
-  
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: jarvis-prometheus
-    hostname: prometheus
-    user: "65534:${PGID:-1002}"
-    ports:
-      - "9090:9090"
-    volumes:
-      - /mnt/appsdata/jarvis/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - /mnt/appsdata/jarvis/prometheus:/prometheus
-    networks:
-      - jarvis-network
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 256M
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: jarvis-grafana
-    hostname: grafana
-    user: "472:${PGID:-1002}"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      GF_INSTALL_PLUGINS: redis-datasource
-    ports:
-      - "3001:3000"
-    volumes:
-      - /mnt/appsdata/jarvis/grafana:/var/lib/grafana
-      - /mnt/appsdata/jarvis/config/grafana/provisioning:/etc/grafana/provisioning:ro
-    networks:
-      - jarvis-network
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 256M

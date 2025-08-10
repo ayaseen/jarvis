@@ -1,10 +1,10 @@
-// services/web/static/app.js
-// Complete WebSocket client with error handling and reconnection
+// services/web/static/app.js - COMPLETE FIXED VERSION
+// WebSocket client with proper connection handling
 
-// Dynamic WebSocket URL based on where you're accessing from
+// Get the WebSocket URL - Use nginx proxy on port 3000
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const wsHost = window.location.hostname;
-const wsPort = '8000';
+const wsPort = window.location.port || '3000';  // Use nginx proxy port
 const wsUrl = `${wsProtocol}//${wsHost}:${wsPort}/ws`;
 
 console.log('JARVIS WebSocket URL:', wsUrl);
@@ -13,10 +13,11 @@ console.log('JARVIS WebSocket URL:', wsUrl);
 let ws = null;
 let currentResponse = null;
 let reconnectAttempts = 0;
-const maxReconnectAttempts = 5;
+const maxReconnectAttempts = 10;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
 let isConnecting = false;
+let sessionId = null;
 
 // DOM elements
 const messagesDiv = document.getElementById('messages');
@@ -32,58 +33,72 @@ function initWebSocket() {
     }
     
     isConnecting = true;
-    console.log('Initializing WebSocket connection...');
+    console.log('Initializing WebSocket connection to:', wsUrl);
     
-    ws = new WebSocket(wsUrl);
-    
-    ws.onopen = () => {
-        console.log('Connected to JARVIS');
-        isConnecting = false;
-        reconnectAttempts = 0;
-        clearSystemMessages();
-        addMessage('✅ Connected to JARVIS', 'system');
+    try {
+        ws = new WebSocket(wsUrl);
         
-        // Enable input
-        messageInput.disabled = false;
-        sendBtn.disabled = false;
+        ws.onopen = () => {
+            console.log('✅ Connected to JARVIS');
+            isConnecting = false;
+            reconnectAttempts = 0;
+            sessionId = null;  // Will be set by server
+            
+            // Clear old messages
+            clearSystemMessages();
+            
+            // Enable input
+            messageInput.disabled = false;
+            sendBtn.disabled = false;
+            
+            // Start heartbeat
+            startHeartbeat();
+        };
         
-        // Start heartbeat
-        startHeartbeat();
-    };
-    
-    ws.onmessage = (event) => {
-        handleMessage(event.data);
-    };
-    
-    ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        isConnecting = false;
-        addMessage('❌ Connection error. Check if backend is running.', 'system');
+        ws.onmessage = (event) => {
+            handleMessage(event.data);
+        };
         
-        // Disable input
-        messageInput.disabled = true;
-        sendBtn.disabled = true;
-        
-        // Try to reconnect
-        scheduleReconnect();
-    };
-    
-    ws.onclose = (event) => {
-        console.log('Disconnected from JARVIS. Code:', event.code, 'Reason:', event.reason);
-        isConnecting = false;
-        
-        // Stop heartbeat
-        stopHeartbeat();
-        
-        // Disable input
-        messageInput.disabled = true;
-        sendBtn.disabled = true;
-        
-        if (event.code !== 1000) { // 1000 = normal closure
-            addMessage('🔴 Disconnected from JARVIS. Attempting to reconnect...', 'system');
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            isConnecting = false;
+            
+            // Show connection error
+            if (messagesDiv) {
+                addMessage('❌ Connection error. Checking services...', 'system');
+            }
+            
+            // Disable input
+            if (messageInput) messageInput.disabled = true;
+            if (sendBtn) sendBtn.disabled = true;
+            
+            // Try to reconnect
             scheduleReconnect();
-        }
-    };
+        };
+        
+        ws.onclose = (event) => {
+            console.log('WebSocket closed. Code:', event.code, 'Reason:', event.reason);
+            isConnecting = false;
+            ws = null;
+            
+            // Stop heartbeat
+            stopHeartbeat();
+            
+            // Disable input
+            if (messageInput) messageInput.disabled = true;
+            if (sendBtn) sendBtn.disabled = true;
+            
+            if (event.code !== 1000) { // 1000 = normal closure
+                addMessage('🔴 Disconnected from JARVIS. Reconnecting...', 'system');
+                scheduleReconnect();
+            }
+        };
+    } catch (error) {
+        console.error('Failed to create WebSocket:', error);
+        isConnecting = false;
+        addMessage('❌ Failed to connect. Please check if services are running.', 'system');
+        scheduleReconnect();
+    }
 }
 
 // Handle incoming messages
@@ -94,9 +109,12 @@ function handleMessage(data) {
         
         if (jsonData.type === 'connection') {
             // Connection established message
-            console.log('Connection confirmed:', jsonData.session_id);
-            if (jsonData.message && jsonData.message !== "JARVIS online. How can I assist you?") {
-                addMessage(jsonData.message, 'jarvis');
+            console.log('Connection confirmed. Session ID:', jsonData.session_id);
+            sessionId = jsonData.session_id;
+            
+            // Show connection message
+            if (jsonData.message) {
+                addMessage('✅ ' + jsonData.message, 'system');
             }
         } else if (jsonData.type === 'complete') {
             // Response complete
@@ -129,6 +147,8 @@ function handleMessage(data) {
 
 // Add message to chat
 function addMessage(text, sender) {
+    if (!messagesDiv) return null;
+    
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${sender}-message`;
     messageDiv.textContent = text;
@@ -139,9 +159,13 @@ function addMessage(text, sender) {
 
 // Clear system messages
 function clearSystemMessages() {
+    if (!messagesDiv) return;
+    
     const systemMessages = messagesDiv.querySelectorAll('.system-message');
     systemMessages.forEach(msg => {
-        if (msg.textContent.includes('Disconnected') || msg.textContent.includes('Reconnecting')) {
+        if (msg.textContent.includes('Disconnected') || 
+            msg.textContent.includes('Reconnecting') || 
+            msg.textContent.includes('Connection error')) {
             msg.remove();
         }
     });
@@ -154,7 +178,9 @@ function sendMessage() {
     
     // Check if WebSocket is connected
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-        addMessage('❌ Not connected. Please wait for reconnection...', 'system');
+        addMessage('❌ Not connected. Please wait...', 'system');
+        // Try to reconnect
+        initWebSocket();
         return;
     }
     
@@ -187,7 +213,11 @@ function startHeartbeat() {
     heartbeatInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
             console.log('Sending heartbeat ping');
-            ws.send(JSON.stringify({ type: 'ping' }));
+            try {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            } catch (error) {
+                console.error('Heartbeat failed:', error);
+            }
         }
     }, 30000); // Send ping every 30 seconds
 }
@@ -202,14 +232,18 @@ function stopHeartbeat() {
 // Reconnection logic
 function scheduleReconnect() {
     if (reconnectAttempts >= maxReconnectAttempts) {
-        addMessage('❌ Maximum reconnection attempts reached. Please refresh the page.', 'system');
+        addMessage('❌ Could not connect after multiple attempts. Please refresh the page.', 'system');
         return;
     }
     
     reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 10000); // Exponential backoff
+    const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 10000);
     
     console.log(`Scheduling reconnect attempt ${reconnectAttempts} in ${delay}ms`);
+    
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+    }
     
     reconnectTimeout = setTimeout(() => {
         addMessage(`🔄 Reconnection attempt ${reconnectAttempts}/${maxReconnectAttempts}...`, 'system');
@@ -218,17 +252,21 @@ function scheduleReconnect() {
 }
 
 // Event listeners
-sendBtn.addEventListener('click', sendMessage);
+if (sendBtn) {
+    sendBtn.addEventListener('click', sendMessage);
+}
 
-messageInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-    }
-});
+if (messageInput) {
+    messageInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+}
 
 // Voice recognition setup (optional)
-if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+if (voiceBtn && ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
     const SpeechRecognition = window.webkitSpeechRecognition || window.SpeechRecognition;
     const recognition = new SpeechRecognition();
     
@@ -257,9 +295,9 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
         if (event.error === 'no-speech') {
             addMessage('⚠️ No speech detected. Please try again.', 'system');
         } else if (event.error === 'not-allowed') {
-            addMessage('❌ Microphone access denied. Please allow microphone access.', 'system');
+            addMessage('❌ Microphone access denied.', 'system');
         } else {
-            addMessage(`❌ Voice recognition error: ${event.error}`, 'system');
+            addMessage(`❌ Voice error: ${event.error}`, 'system');
         }
     };
     
@@ -282,12 +320,10 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             addMessage('❌ Failed to start voice recognition.', 'system');
         }
     });
-} else {
+} else if (voiceBtn) {
     // Hide voice button if not supported
-    if (voiceBtn) {
-        voiceBtn.style.display = 'none';
-        console.log('Voice recognition not supported in this browser');
-    }
+    voiceBtn.style.display = 'none';
+    console.log('Voice recognition not supported in this browser');
 }
 
 // Add custom styles
@@ -346,18 +382,69 @@ button:disabled {
     white-space: pre-wrap;
     word-wrap: break-word;
 }
+
+.connection-status {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    padding: 5px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    z-index: 1000;
+}
+
+.status-connected {
+    background: rgba(52, 211, 153, 0.2);
+    color: #34d399;
+    border: 1px solid #34d399;
+}
+
+.status-disconnected {
+    background: rgba(248, 113, 113, 0.2);
+    color: #f87171;
+    border: 1px solid #f87171;
+}
 `;
 document.head.appendChild(style);
+
+// Connection status indicator
+function createStatusIndicator() {
+    const statusDiv = document.createElement('div');
+    statusDiv.id = 'connectionStatus';
+    statusDiv.className = 'connection-status status-disconnected';
+    statusDiv.textContent = '● Offline';
+    document.body.appendChild(statusDiv);
+    return statusDiv;
+}
+
+function updateConnectionStatus(connected) {
+    const statusDiv = document.getElementById('connectionStatus') || createStatusIndicator();
+    if (connected) {
+        statusDiv.className = 'connection-status status-connected';
+        statusDiv.textContent = '● Connected';
+    } else {
+        statusDiv.className = 'connection-status status-disconnected';
+        statusDiv.textContent = '● Offline';
+    }
+}
 
 // Initialize connection on page load
 document.addEventListener('DOMContentLoaded', () => {
     console.log('Page loaded, initializing JARVIS...');
+    
+    // Create status indicator
+    updateConnectionStatus(false);
     
     // Initial connection message
     addMessage('🔄 Connecting to JARVIS...', 'system');
     
     // Start WebSocket connection
     initWebSocket();
+    
+    // Update status based on WebSocket state
+    setInterval(() => {
+        updateConnectionStatus(ws && ws.readyState === WebSocket.OPEN);
+    }, 1000);
     
     // Handle page visibility changes
     document.addEventListener('visibilitychange', () => {
@@ -378,6 +465,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('offline', () => {
         console.log('Network offline');
         addMessage('❌ Network connection lost', 'system');
+        updateConnectionStatus(false);
     });
 });
 
