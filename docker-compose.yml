@@ -8,6 +8,10 @@ x-common-variables: &common-variables
 networks:
   jarvis-network:
     driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.22.0.0/16
 
 services:
   # ============= Infrastructure Services =============
@@ -15,111 +19,187 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     container_name: jarvis-postgres
+    hostname: postgres
+    user: "999:${PGID:-1002}"
     environment:
       <<: *common-variables
       POSTGRES_DB: ${POSTGRES_DB:-jarvis}
       POSTGRES_USER: ${POSTGRES_USER:-jarvis}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
+      PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "5432:5432"
     volumes:
       - /mnt/appsdata/jarvis/postgres:/var/lib/postgresql/data
       - /mnt/appsdata/jarvis/init-scripts:/docker-entrypoint-initdb.d:ro
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jarvis"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
 
   redis:
     image: redis:7-alpine
     container_name: jarvis-redis
-    environment:
-      <<: *common-variables
-    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    hostname: redis
+    user: "999:${PGID:-1002}"
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru --dir /data
     ports:
       - "6379:6379"
     volumes:
       - /mnt/appsdata/jarvis/redis:/data
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: jarvis-qdrant
+  # ============= Milvus Vector Database with GPU =============
+  
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.18
     environment:
-      <<: *common-variables
-    ports:
-      - "6333:6333"
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - /mnt/appsdata/jarvis/qdrant:/qdrant/storage
-      - /mnt/appsdata/jarvis/config/qdrant.yaml:/qdrant/config/production.yaml:ro
+      - /mnt/appsdata/jarvis/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - /mnt/appsdata/jarvis/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    networks:
+      jarvis-network:
+        aliases:
+          - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.0-gpu
+    command: ["milvus", "run", "standalone"]
+    hostname: milvus
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    volumes:
+      - /mnt/appsdata/jarvis/milvus/db:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    networks:
+      jarvis-network:
+        aliases:
+          - milvus
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: ["gpu"]
+              device_ids: ["0"]
+          memory: 2G
+    depends_on:
+      - etcd
+      - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
     restart: unless-stopped
 
-  # ============= vLLM Service (Replaces Ollama) =============
-  # vllm:
-  #   image: vllm/vllm-openai:latest
-  #   container_name: jarvis-vllm
-  #   environment:
-  #     <<: *common-variables
-  #     HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
-  #   ports:
-  #     - "8080:8000"  # vLLM API on port 8080 to avoid conflict
-  #   volumes:
-  #     - /mnt/appsdata/jarvis/models/vllm:/root/.cache/huggingface
-  #   networks:
-  #     - jarvis-network
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             device_ids: ['0']
-  #             capabilities: [gpu]
-  #   command: [
-  #     "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
-  #     "--max-model-len", "${VLLM_MAX_MODEL_LEN:-4096}",
-  #     "--gpu-memory-utilization", "${VLLM_GPU_MEMORY:-0.9}",
-  #     "--quantization", "${VLLM_QUANTIZATION:-awq}",
-  #     "--dtype", "auto",
-  #     "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
-  #     "--host", "0.0.0.0",
-  #     "--port", "8000"
-  #   ]
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
+  # ============= vLLM Service with Memory Optimization =============
   vllm:
     image: vllm/vllm-openai:latest
     container_name: jarvis-vllm
+    hostname: vllm
     environment:
       <<: *common-variables
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_TOKEN:-}
-      # Add memory optimization env vars
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:512"
       CUDA_VISIBLE_DEVICES: "0"
+      VLLM_USAGE_SOURCE: docker
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
     ports:
       - "8080:8000"
     volumes:
       - /mnt/appsdata/jarvis/models/vllm:/root/.cache/huggingface
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - vllm
     deploy:
       resources:
+        limits:
+          memory: 10G
         reservations:
           devices:
             - driver: nvidia
@@ -127,14 +207,16 @@ services:
               capabilities: [gpu]
     command: [
       "--model", "${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}",
-      "--max-model-len", "2048",  # REDUCED from 4096
-      "--gpu-memory-utilization", "0.8",  # REDUCED from 0.9
-      "--quantization", "awq_marlin",  # CHANGED to awq_marlin for better performance
-      "--dtype", "auto",
+      "--max-model-len", "2048",
+      "--gpu-memory-utilization", "0.75",
+      "--quantization", "awq",
+      "--dtype", "half",
       "--api-key", "${VLLM_API_KEY:-jarvis-key-123}",
       "--host", "0.0.0.0",
       "--port", "8000",
-      "--enforce-eager"  # ADDED to disable CUDA graphs (saves memory)
+      "--enforce-eager",
+      "--max-num-batched-tokens", "2048",
+      "--max-num-seqs", "8"
     ]
     restart: unless-stopped
     healthcheck:
@@ -142,18 +224,20 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-  # ============= JARVIS Services =============
+      start_period: 90s
+
+  # ============= JARVIS Services with Private Registry =============
   
   llm-service:
-    image: felix971/jarvis-llm:v1.0.0
+    image: hub.rhlab.dev/jarvis/llm:latest
     container_name: jarvis-llm
+    hostname: llm-service
     deploy:
       resources:
+        limits:
+          memory: 2G
         reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']
-              capabilities: [gpu]
+          memory: 512M
     environment:
       <<: *common-variables
       VLLM_HOST: vllm
@@ -161,27 +245,34 @@ services:
       VLLM_API_KEY: ${VLLM_API_KEY:-jarvis-key-123}
       REDIS_HOST: redis
       MODEL_NAME: ${VLLM_MODEL:-TheBloke/Mistral-7B-Instruct-v0.2-AWQ}
-      CUDA_VISIBLE_DEVICES: "0"
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     ports:
       - "8001:8001"
     volumes:
       - /mnt/appsdata/jarvis/shared:/shared
       - /mnt/appsdata/jarvis/logs/llm:/logs
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - llm-service
     depends_on:
       - vllm
       - redis
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
 
   rag-service:
-    image: felix971/jarvis-rag:v1.0.0
+    image: hub.rhlab.dev/jarvis/rag:latest
     container_name: jarvis-rag
+    hostname: rag-service
     deploy:
       resources:
+        limits:
+          memory: 3G
         reservations:
           devices:
             - driver: nvidia
@@ -189,13 +280,15 @@ services:
               capabilities: [gpu]
     environment:
       <<: *common-variables
-      QDRANT_HOST: qdrant
+      # CHANGED FROM QDRANT TO MILVUS
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
       POSTGRES_HOST: postgres
       POSTGRES_USER: ${POSTGRES_USER:-jarvis}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis123}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       CUDA_VISIBLE_DEVICES: "0"
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
       TRANSFORMERS_CACHE: /models/transformers
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -207,17 +300,28 @@ services:
       - /mnt/appsdata/jarvis/models/transformers:/models/transformers
       - /mnt/appsdata/jarvis/logs/rag:/logs
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - rag-service
     depends_on:
-      - qdrant
+      - milvus  # CHANGED FROM qdrant
       - postgres
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
 
   voice-service:
-    image: felix971/jarvis-voice:v1.0.0
+    image: hub.rhlab.dev/jarvis/voice:latest
     container_name: jarvis-voice
+    hostname: voice-service
     deploy:
       resources:
+        limits:
+          memory: 3G
         reservations:
           devices:
             - driver: nvidia
@@ -225,10 +329,11 @@ services:
               capabilities: [gpu]
     environment:
       <<: *common-variables
-      WHISPER_MODEL: ${WHISPER_MODEL:-base.en}
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny.en}
       TTS_MODEL: ${TTS_MODEL:-tts_models/en/ljspeech/tacotron2-DDC}
+      FORCE_CPU: ${VOICE_FORCE_CPU:-false}
       CUDA_VISIBLE_DEVICES: "0"
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,max_split_size_mb:128"
       WHISPER_CACHE: /models/whisper
       TTS_CACHE: /models/tts
       NVIDIA_VISIBLE_DEVICES: all
@@ -241,12 +346,27 @@ services:
       - /mnt/appsdata/jarvis/shared:/shared
       - /mnt/appsdata/jarvis/logs/voice:/logs
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - voice-service
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
   orchestrator:
-    image: felix971/jarvis-orchestrator:v1.0.0
+    image: hub.rhlab.dev/jarvis/orchestrator:latest
     container_name: jarvis-orchestrator
+    hostname: orchestrator
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
     environment:
       <<: *common-variables
       LLM_SERVICE_URL: http://llm-service:8001
@@ -265,16 +385,31 @@ services:
       - /mnt/appsdata/jarvis/shared:/shared
       - /mnt/appsdata/jarvis/logs/orchestrator:/logs
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - orchestrator
     depends_on:
       - llm-service
       - rag-service
       - voice-service
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
 
   web:
-    image: felix971/jarvis-web:v1.0.0
+    image: hub.rhlab.dev/jarvis/web:latest
     container_name: jarvis-web
+    hostname: web
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
     environment:
       <<: *common-variables
     ports:
@@ -282,20 +417,27 @@ services:
     volumes:
       - /mnt/appsdata/jarvis/logs/nginx:/var/log/nginx
     networks:
-      - jarvis-network
+      jarvis-network:
+        aliases:
+          - web
     depends_on:
       - orchestrator
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
-  # ============= Monitoring =============
+  # ============= Optional Monitoring Services =============
   
   prometheus:
     image: prom/prometheus:latest
     container_name: jarvis-prometheus
-    environment:
-      <<: *common-variables
+    hostname: prometheus
+    user: "65534:${PGID:-1002}"
     ports:
-      - "9098:9098"
+      - "9090:9090"
     volumes:
       - /mnt/appsdata/jarvis/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - /mnt/appsdata/jarvis/prometheus:/prometheus
@@ -304,15 +446,21 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
 
   grafana:
     image: grafana/grafana:latest
     container_name: jarvis-grafana
+    hostname: grafana
+    user: "472:${PGID:-1002}"
     environment:
-      <<: *common-variables
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_INSTALL_PLUGINS: redis-datasource
     ports:
@@ -323,3 +471,9 @@ services:
     networks:
       - jarvis-network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
