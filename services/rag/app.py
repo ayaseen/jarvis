@@ -386,9 +386,11 @@ class RAGEngine:
             
             logger.info(f"Loaded embedding model: {EMBEDDING_MODEL} (dim={self.embedding_dim})")
             
-            # Update global variable
+            # Update global variable if needed
             global EMBEDDING_DIM
-            EMBEDDING_DIM = self.embedding_dim
+            if self.embedding_dim != EMBEDDING_DIM:
+                EMBEDDING_DIM = self.embedding_dim
+                logger.info(f"Updated global EMBEDDING_DIM to {EMBEDDING_DIM}")
             
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
