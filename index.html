@@ -1,0 +1,183 @@
+<!-- services/web/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS AI Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        /* Model Manager Button Styling */
+        .model-manager-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 212, 255, 0.2);
+            border: 2px solid #00d4ff;
+            color: #fff;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: all 0.3s;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .model-manager-btn:hover {
+            background: rgba(0, 212, 255, 0.4);
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
+        }
+        
+        .model-status {
+            position: fixed;
+            top: 70px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            color: #a0a0a0;
+            z-index: 999;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(0, 212, 255, 0.2);
+        }
+        
+        .model-status.error {
+            color: #f87171;
+            border-color: #f87171;
+            animation: pulse-error 2s infinite;
+        }
+        
+        .model-status.success {
+            color: #4ade80;
+            border-color: #4ade80;
+        }
+        
+        @keyframes pulse-error {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
+        /* Add floating animation to arc reactor */
+        .arc-reactor {
+            animation: float 3s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Model Manager Button -->
+    <a href="/models.html" class="model-manager-btn" title="Manage AI Models">
+        <span>⚙️</span>
+        <span>Model Manager</span>
+    </a>
+    
+    <!-- Model Status Indicator -->
+    <div id="modelStatus" class="model-status">
+        <span id="statusText">Checking model...</span>
+    </div>
+    
+    <div id="app">
+        <div class="jarvis-container">
+            <div class="arc-reactor">
+                <div class="core"></div>
+            </div>
+            <h1>JARVIS</h1>
+            <div id="chat-container">
+                <div id="messages"></div>
+                <div class="input-group">
+                    <input type="text" id="message-input" placeholder="Ask JARVIS...">
+                    <button id="send-btn">Send</button>
+                    <button id="voice-btn">🎤</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+    <script>
+        // Check model status and update indicator
+        async function checkModelStatus() {
+            const statusEl = document.getElementById('modelStatus');
+            const statusText = document.getElementById('statusText');
+            
+            try {
+                // First check if Ollama is running
+                const ollamaResponse = await fetch('http://' + window.location.hostname + ':11434/api/tags');
+                
+                if (!ollamaResponse.ok) {
+                    statusText.textContent = '⚠️ Ollama offline';
+                    statusEl.className = 'model-status error';
+                    return;
+                }
+                
+                const data = await ollamaResponse.json();
+                
+                if (data.models && data.models.length > 0) {
+                    // Get active model from localStorage or first available
+                    const activeModel = localStorage.getItem('activeModel') || data.models[0].name;
+                    const modelSize = (data.models[0].size / 1e9).toFixed(1);
+                    statusText.textContent = `✅ Model: ${activeModel} (${modelSize}GB)`;
+                    statusEl.className = 'model-status success';
+                } else {
+                    statusText.innerHTML = '⚠️ No model loaded - <a href="/models.html" style="color: #00d4ff;">Click here to install</a>';
+                    statusEl.className = 'model-status error';
+                }
+                
+            } catch (error) {
+                console.error('Model status check failed:', error);
+                statusText.textContent = '❌ Connection error';
+                statusEl.className = 'model-status error';
+            }
+        }
+        
+        // Check on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            checkModelStatus();
+            
+            // Check every 30 seconds
+            setInterval(checkModelStatus, 30000);
+            
+            // Add click effect to model manager button
+            const modelBtn = document.querySelector('.model-manager-btn');
+            if (modelBtn) {
+                modelBtn.addEventListener('click', function(e) {
+                    // Add ripple effect
+                    const ripple = document.createElement('span');
+                    ripple.style.cssText = `
+                        position: absolute;
+                        background: rgba(255,255,255,0.5);
+                        border-radius: 50%;
+                        width: 20px;
+                        height: 20px;
+                        animation: ripple 0.6s;
+                        pointer-events: none;
+                    `;
+                    this.appendChild(ripple);
+                    setTimeout(() => ripple.remove(), 600);
+                });
+            }
+        });
+        
+        // Add ripple animation
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes ripple {
+                to {
+                    transform: scale(4);
+                    opacity: 0;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    </script>
+</body>
+</html>
