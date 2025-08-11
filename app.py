@@ -15,8 +15,6 @@ import traceback
 import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import subprocess
-import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,7 +83,6 @@ async def root():
             "chat": "/api/chat",
             "stream": "/api/chat/stream",
             "models": "/api/models",
-            "models_update": "/api/models/update",
             "health": "/health"
         }
     }
@@ -161,7 +158,7 @@ async def list_models():
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 f"{VLLM_URL}/v1/models",
-                headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"}  # FIXED: Added auth header
             )
             if response.status_code == 200:
                 return response.json()
@@ -177,228 +174,6 @@ async def list_models():
         ],
         "object": "list"
     }
-
-@app.post("/api/models/update")
-async def update_model_config(request: dict):
-    """Update vLLM model configuration and trigger restart"""
-    try:
-        model = request.get("model")
-        max_tokens = request.get("max_tokens", 4096)
-        gpu_memory = request.get("gpu_memory", 0.5)
-        
-        if not model:
-            raise HTTPException(status_code=400, detail="Model name required")
-        
-        logger.info(f"Updating vLLM model to: {model}")
-        
-        # Path to .env file (adjust based on your setup)
-        env_path = "/mnt/appsdata/jarvis/.env"
-        
-        # If .env doesn't exist in expected location, try current directory
-        if not os.path.exists(env_path):
-            env_path = ".env"
-        
-        # If still doesn't exist, try parent directory
-        if not os.path.exists(env_path):
-            env_path = "../.env"
-        
-        # Create backup of current .env
-        if os.path.exists(env_path):
-            backup_path = f"{env_path}.backup.{int(time.time())}"
-            shutil.copy2(env_path, backup_path)
-            logger.info(f"Created backup: {backup_path}")
-        
-        # Read current .env
-        env_lines = []
-        env_dict = {}
-        
-        if os.path.exists(env_path):
-            with open(env_path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        env_dict[key.strip()] = value.strip()
-                    env_lines.append(line)
-        
-        # Update vLLM configuration
-        env_dict['VLLM_MODEL'] = model
-        env_dict['VLLM_MAX_MODEL_LEN'] = str(max_tokens)
-        env_dict['VLLM_GPU_MEMORY'] = str(gpu_memory)
-        
-        # Write updated .env file
-        with open(env_path, 'w') as f:
-            # Write header
-            f.write("# JARVIS Environment Configuration\n")
-            f.write("# Updated: " + datetime.now().isoformat() + "\n\n")
-            
-            # Write all environment variables
-            for key, value in env_dict.items():
-                f.write(f"{key}={value}\n")
-        
-        logger.info(f"Updated .env file at: {env_path}")
-        
-        # Update environment variables for current process
-        os.environ['MODEL_NAME'] = model
-        os.environ['VLLM_MODEL'] = model
-        os.environ['VLLM_MAX_MODEL_LEN'] = str(max_tokens)
-        os.environ['VLLM_GPU_MEMORY'] = str(gpu_memory)
-        
-        # Restart vLLM service using docker-compose
-        try:
-            # Try different possible locations for docker-compose
-            compose_commands = [
-                ["docker-compose", "restart", "vllm"],
-                ["docker", "compose", "restart", "vllm"],
-                ["/usr/local/bin/docker-compose", "restart", "vllm"],
-                ["/usr/bin/docker-compose", "restart", "vllm"],
-            ]
-            
-            restart_successful = False
-            for cmd in compose_commands:
-                try:
-                    logger.info(f"Attempting restart with command: {' '.join(cmd)}")
-                    
-                    # Change to directory containing docker-compose.yml if needed
-                    compose_dir = "/mnt/appsdata/jarvis"
-                    if not os.path.exists(os.path.join(compose_dir, "docker-compose.yml")):
-                        compose_dir = "."
-                    if not os.path.exists(os.path.join(compose_dir, "docker-compose.yml")):
-                        compose_dir = ".."
-                    
-                    result = subprocess.run(
-                        cmd,
-                        cwd=compose_dir,
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-                    
-                    if result.returncode == 0:
-                        restart_successful = True
-                        logger.info("vLLM restart command executed successfully")
-                        break
-                    else:
-                        logger.warning(f"Command failed: {result.stderr}")
-                        
-                except FileNotFoundError:
-                    continue
-                except Exception as e:
-                    logger.warning(f"Command failed: {e}")
-                    continue
-            
-            if not restart_successful:
-                # Try using Docker API directly as fallback
-                logger.info("Attempting restart using Docker API directly")
-                result = subprocess.run(
-                    ["docker", "restart", "vllm"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                if result.returncode != 0:
-                    raise Exception("Failed to restart vLLM container")
-            
-            # Store the update in Redis for tracking
-            if redis_client:
-                update_info = {
-                    "model": model,
-                    "max_tokens": max_tokens,
-                    "gpu_memory": gpu_memory,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "status": "restarting"
-                }
-                redis_client.setex(
-                    "vllm:update:latest",
-                    300,  # 5 minutes expiry
-                    json.dumps(update_info)
-                )
-            
-            return {
-                "status": "success",
-                "message": f"vLLM is restarting with model: {model}",
-                "model": model,
-                "max_tokens": max_tokens,
-                "gpu_memory": gpu_memory,
-                "note": "Model loading may take 30-60 seconds"
-            }
-            
-        except subprocess.TimeoutExpired:
-            logger.error("Docker restart command timed out")
-            raise HTTPException(
-                status_code=500,
-                detail="Restart command timed out. Please check Docker manually."
-            )
-        except Exception as e:
-            logger.error(f"Failed to restart vLLM: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to restart vLLM service: {str(e)}"
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Model update error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/models/status")
-async def get_model_status():
-    """Get current model status and configuration"""
-    try:
-        status = {
-            "vllm_healthy": False,
-            "model_loaded": False,
-            "current_model": None,
-            "config": {
-                "max_model_len": int(os.getenv('VLLM_MAX_MODEL_LEN', '2048')),
-                "gpu_memory_utilization": float(os.getenv('VLLM_GPU_MEMORY', '0.5')),
-                "quantization": "AWQ" if "AWQ" in os.getenv('VLLM_MODEL', '') else "None"
-            }
-        }
-        
-        # Check vLLM health
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            try:
-                response = await client.get(f"{VLLM_URL}/health")
-                status["vllm_healthy"] = response.status_code == 200
-            except:
-                pass
-            
-            # Get current model
-            try:
-                response = await client.get(
-                    f"{VLLM_URL}/v1/models",
-                    headers={"Authorization": f"Bearer {VLLM_API_KEY}"}
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    models = data.get("data", [])
-                    if models:
-                        status["model_loaded"] = True
-                        status["current_model"] = models[0]["id"]
-            except:
-                pass
-        
-        # Check for recent update status in Redis
-        if redis_client:
-            try:
-                update_info = redis_client.get("vllm:update:latest")
-                if update_info:
-                    status["recent_update"] = json.loads(update_info)
-            except:
-                pass
-        
-        return status
-        
-    except Exception as e:
-        logger.error(f"Status check error: {e}")
-        return {
-            "vllm_healthy": False,
-            "model_loaded": False,
-            "error": str(e)
-        }
 
 @app.post("/api/chat")
 async def chat_endpoint(request: dict):
@@ -454,7 +229,7 @@ async def chat_endpoint(request: dict):
             response = await client.post(
                 f"{VLLM_URL}/v1/completions",
                 json={
-                    "model": os.getenv('VLLM_MODEL', MODEL_NAME),
+                    "model": MODEL_NAME,
                     "prompt": prompt,
                     "max_tokens": 512,
                     "temperature": 0.7,
@@ -541,7 +316,7 @@ async def chat_stream(request: dict):
                     "POST",
                     f"{VLLM_URL}/v1/completions",
                     json={
-                        "model": os.getenv('VLLM_MODEL', MODEL_NAME),
+                        "model": MODEL_NAME,
                         "prompt": prompt,
                         "max_tokens": 512,
                         "temperature": 0.7,
@@ -579,7 +354,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"WebSocket connection established: {session_id}")
     
     try:
-        # Send initial connection message
+        # FIXED: Send initial connection message
         await websocket.send_json({
             "type": "connection",
             "session_id": session_id,
@@ -635,7 +410,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "POST",
                         f"{VLLM_URL}/v1/completions",
                         json={
-                            "model": os.getenv('VLLM_MODEL', MODEL_NAME),
+                            "model": MODEL_NAME,
                             "prompt": prompt,
                             "max_tokens": 512,
                             "temperature": 0.7,
