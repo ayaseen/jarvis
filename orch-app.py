@@ -1,4 +1,4 @@
-# services/orchestrator/app.py - COMPLETE PRODUCTION VERSION WITH LARGE DOCUMENT SUPPORT
+# services/orchestrator/app.py - COMPLETE PRODUCTION VERSION
 from fastapi import FastAPI, WebSocket, HTTPException, Query, File, UploadFile, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response, JSONResponse
@@ -95,45 +95,6 @@ health_cache = {
     "cache_duration": 10,  # seconds
     "data": None
 }
-
-def truncate_context(context_docs: list, max_tokens: int = 1200) -> str:
-    """
-    Truncate context to fit within token limits
-    
-    Args:
-        context_docs: List of document chunks from RAG
-        max_tokens: Maximum tokens for context (leaving room for prompt and response)
-    
-    Returns:
-        Truncated context string
-    """
-    # Rough estimation: 1 token ≈ 4 characters
-    max_chars = max_tokens * 4
-    
-    context_parts = []
-    total_chars = 0
-    
-    # Sort by relevance (assuming they're already sorted by score)
-    for doc in context_docs:
-        text = doc.get('text', '')
-        
-        # Add document with separator
-        doc_text = f"[Document excerpt]: {text}\n\n"
-        doc_chars = len(doc_text)
-        
-        # Check if adding this would exceed limit
-        if total_chars + doc_chars > max_chars:
-            # Try to add partial content
-            remaining = max_chars - total_chars
-            if remaining > 100:  # Only add if we have reasonable space
-                truncated_text = text[:remaining-50] + "..."
-                context_parts.append(f"[Document excerpt]: {truncated_text}")
-            break
-        
-        context_parts.append(f"[Document excerpt]: {text}")
-        total_chars += doc_chars
-    
-    return "\n\n".join(context_parts)
 
 async def check_service_health(service_url: str, service_name: str, timeout: float = 5.0) -> tuple:
     """Check health of a service with proper error handling"""
@@ -317,7 +278,7 @@ async def upload_document(
         logger.info(f"Saved file: {safe_filename} to {file_path} ({len(file_content)} bytes)")
         
         # Send to RAG service for indexing
-        async with httpx.AsyncClient(timeout=180.0) as client:  # Increased timeout for large files
+        async with httpx.AsyncClient(timeout=120.0) as client:
             # Reset file for reading
             await file.seek(0)
             
@@ -356,8 +317,7 @@ async def upload_document(
                                 "collection": collection,
                                 "path": file_path,
                                 "hash": file_hash,
-                                "original_filename": file.filename,
-                                "average_chunk_size": result.get("average_chunk_size", 0)
+                                "original_filename": file.filename
                             })
                         ))
                         conn.commit()
@@ -376,7 +336,6 @@ async def upload_document(
                 "file_hash": result.get("file_hash", file_hash),
                 "path": file_path,
                 "text_length": result.get("text_length", 0),
-                "average_chunk_size": result.get("average_chunk_size", 0),
                 "sample_text": result.get("sample_text", "")
             }
         else:
@@ -415,10 +374,10 @@ async def list_documents(limit: int = Query(default=50)):
     """List indexed documents with complete information"""
     documents = []
     total_chunks = 0
-    collection_stats = {}
     
     try:
         # Get collection stats from RAG service first
+        collection_stats = {}
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 collections_response = await client.get(f"{RAG_SERVICE}/collections")
@@ -484,7 +443,7 @@ async def list_documents(limit: int = Query(default=50)):
         "documents": documents[:limit], 
         "total": len(documents),
         "total_chunks": total_chunks,
-        "collections": collection_stats
+        "collections": collection_stats if 'collection_stats' in locals() else {}
     }
 
 @app.get("/api/collections")
@@ -549,7 +508,7 @@ async def test_rag(query: str = Query(...)):
 
 @app.post("/api/chat")
 async def chat_endpoint(request: dict):
-    """Synchronous chat endpoint with RAG integration and smart context management"""
+    """Synchronous chat endpoint with RAG integration"""
     try:
         message = request.get("message", "")
         use_rag = request.get("use_rag", True)
@@ -568,7 +527,6 @@ async def chat_endpoint(request: dict):
         context_docs = []
         context_used = False
         context_count = 0
-        context_text = ""
         
         if use_rag:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -579,8 +537,8 @@ async def chat_endpoint(request: dict):
                         json={
                             "query": message,
                             "collection": collection,
-                            "top_k": 3,  # Limit to 3 chunks to avoid token overflow
-                            "threshold": 0.3
+                            "top_k": 3,
+                            "threshold": 0.3  # Lower threshold for better recall
                         }
                     )
                     if response.status_code == 200:
@@ -590,31 +548,20 @@ async def chat_endpoint(request: dict):
                         context_used = context_count > 0
                         logger.info(f"RAG found {context_count} documents")
                         if context_docs:
-                            logger.info(f"Top result score: {context_docs[0].get('score', 0):.3f}")
+                            logger.info(f"Top result: {context_docs[0].get('text', '')[:100]}...")
                 except Exception as e:
                     logger.error(f"RAG search failed: {e}")
         
-        # Prepare prompt with TRUNCATED context
+        # Prepare prompt with context
         prompt = message
         if context_docs:
-            # Use the truncate_context function to limit context size
-            context_text = truncate_context(context_docs, max_tokens=1200)
-            
-            # Log context size
-            logger.info(f"Context size: {len(context_text)} characters (~{len(context_text)//4} tokens)")
-            
-            prompt = f"""Based on the following information, answer the question.
-
-Context:
-{context_text}
-
-Question: {message}
-
-Answer:"""
+            context_text = "\n\n".join([
+                f"[Document {i+1}]: {doc.get('text', '')}"
+                for i, doc in enumerate(context_docs)
+            ])
+            prompt = f"Use the following context to answer the question:\n\n{context_text}\n\nQuestion: {message}\n\nAnswer:"
         
-        # Generate response using LLM service with reduced max_tokens for large contexts
-        max_response_tokens = 400 if context_docs else 512
-        
+        # Generate response using LLM service
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{LLM_SERVICE}/generate",
@@ -623,7 +570,7 @@ Answer:"""
                     "session_id": session_id,
                     "stream": False,
                     "temperature": 0.7,
-                    "max_tokens": max_response_tokens
+                    "max_tokens": 512
                 }
             )
             
@@ -639,8 +586,7 @@ Answer:"""
                     "response": answer,
                     "session_id": session_id,
                     "context_used": context_used,
-                    "context_count": context_count,
-                    "context_characters": len(context_text) if context_docs else 0
+                    "context_count": context_count
                 }
             else:
                 error_msg = f"LLM service returned status {response.status_code}"
@@ -655,7 +601,7 @@ Answer:"""
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time chat with context management"""
+    """WebSocket endpoint for real-time chat"""
     await websocket.accept()
     session_id = str(uuid.uuid4())
     active_connections[session_id] = websocket
@@ -715,22 +661,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         except Exception as e:
                             logger.error(f"WebSocket RAG search failed: {e}")
                 
-                # Prepare prompt with truncated context
+                # Prepare prompt
                 prompt = user_message
                 if context_docs:
-                    context_text = truncate_context(context_docs, max_tokens=1200)
-                    prompt = f"""Based on the following information, answer the question.
-
-Context:
-{context_text}
-
-Question: {user_message}
-
-Answer:"""
+                    context_text = "\n\n".join([doc.get("text", "") for doc in context_docs])
+                    prompt = f"Context:\n{context_text}\n\nQuestion: {user_message}\n\nAnswer:"
                 
-                # Stream response from LLM with appropriate token limit
-                max_response_tokens = 400 if context_docs else 512
-                
+                # Stream response from LLM
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     async with client.stream(
                         "POST",
@@ -740,7 +677,7 @@ Answer:"""
                             "session_id": session_id,
                             "stream": True,
                             "temperature": 0.7,
-                            "max_tokens": max_response_tokens
+                            "max_tokens": 512
                         }
                     ) as response:
                         full_response = ""

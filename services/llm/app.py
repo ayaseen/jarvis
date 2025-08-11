@@ -134,33 +134,33 @@ class LLMEngine:
                 except Exception as e:
                     logger.error(f"Redis error: {e}")
             
-            # Build messages for vLLM chat completion
-            messages = self._build_messages(request, context, conversation_history)
+            # Build prompt for completions API (NOT chat completions)
+            prompt = self._build_prompt(request, context, conversation_history)
             
             client = await self.get_client()
             
             # Store the full response for session history
             full_response = ""
             
-            # Use vLLM's OpenAI-compatible chat completions endpoint
+            # Use vLLM's completions endpoint (NOT chat completions) - FIXED!
             try:
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url}/chat/completions",
-                    json={
-                        "model": self.model,
-                        "messages": messages,
-                        "stream": request.stream,
-                        "temperature": request.temperature,
-                        "max_tokens": request.max_tokens,
-                        "top_p": 0.95,
-                        "frequency_penalty": 0.0,
-                        "presence_penalty": 0.0,
-                    }
-                ) as response:
-                    response.raise_for_status()
-                    
-                    if request.stream:
+                if request.stream:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url}/completions",  # FIXED: Using /completions not /chat/completions
+                        json={
+                            "model": self.model,
+                            "prompt": prompt,  # Single prompt string
+                            "stream": True,
+                            "temperature": request.temperature,
+                            "max_tokens": request.max_tokens,
+                            "top_p": 0.95,
+                            "frequency_penalty": 0.0,
+                            "presence_penalty": 0.0,
+                        }
+                    ) as response:
+                        response.raise_for_status()
+                        
                         async for line in response.aiter_lines():
                             if line.startswith("data: "):
                                 line_data = line[6:]
@@ -169,19 +169,32 @@ class LLMEngine:
                                 try:
                                     data = json.loads(line_data)
                                     if "choices" in data and data["choices"]:
-                                        delta = data["choices"][0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        if content:
-                                            full_response += content
-                                            yield content
+                                        text = data["choices"][0].get("text", "")
+                                        if text:
+                                            full_response += text
+                                            yield text
                                 except json.JSONDecodeError as e:
                                     logger.error(f"Failed to parse: {line_data}, error: {e}")
-                    else:
-                        # Non-streaming response
-                        response_data = await response.json()
-                        if "choices" in response_data and response_data["choices"]:
-                            full_response = response_data["choices"][0]["message"]["content"]
-                            yield full_response
+                else:
+                    # Non-streaming response
+                    response = await client.post(
+                        f"{self.base_url}/completions",  # FIXED: Using /completions
+                        json={
+                            "model": self.model,
+                            "prompt": prompt,
+                            "stream": False,
+                            "temperature": request.temperature,
+                            "max_tokens": request.max_tokens,
+                            "top_p": 0.95,
+                        }
+                    )
+                    response.raise_for_status()
+                    response_data = response.json()
+                    
+                    if "choices" in response_data and response_data["choices"]:
+                        full_response = response_data["choices"][0]["text"]
+                        yield full_response
+                        
             except httpx.ConnectError as e:
                 logger.error(f"Connection error to vLLM: {e}")
                 self.vllm_available = False
@@ -213,48 +226,62 @@ class LLMEngine:
                     logger.error(f"Failed to store conversation history: {e}")
                             
         except httpx.HTTPStatusError as e:
-            logger.error(f"vLLM API error: {e.response.text}")
+            # FIXED: Handle streaming response error properly
+            error_text = "Unknown error"
+            try:
+                # For streaming responses, we need to read the content first
+                error_text = await e.response.aread()
+                error_text = error_text.decode('utf-8') if isinstance(error_text, bytes) else str(error_text)
+            except:
+                error_text = f"Status {e.response.status_code}"
+            
+            logger.error(f"vLLM API error: {error_text}")
             yield f"Error: vLLM service error - {e.response.status_code}"
+            
         except httpx.TimeoutException as e:
             logger.error(f"vLLM timeout: {e}")
             yield "Error: Request to vLLM timed out. The model might be loading or overwhelmed."
+            
         except Exception as e:
             logger.error(f"Generation error: {traceback.format_exc()}")
             yield f"Error: {str(e)}"
+            
         finally:
             response_time.observe(time.time() - start_time)
     
-    def _build_messages(self, request: ChatRequest, context: Optional[str], history: list) -> list:
-        """Build messages array for OpenAI-compatible API with full context"""
-        messages = []
-        
+    def _build_prompt(self, request: ChatRequest, context: Optional[str], history: list) -> str:
+        """Build prompt string for completions API (not chat format)"""
         # System message
         system_content = request.system_prompt or """You are JARVIS, an advanced AI assistant inspired by Tony Stark's AI.
 You are helpful, witty, and efficient. You provide concise but thorough responses.
 You have a slightly sarcastic personality but remain professional and helpful.
 Always be accurate and informative while maintaining an engaging conversational style."""
         
-        messages.append({"role": "system", "content": system_content})
+        # Build the prompt as a single string
+        prompt_parts = []
+        
+        # Add system instruction
+        prompt_parts.append(f"System: {system_content}\n")
         
         # Add context from RAG if available
         if context:
-            messages.append({
-                "role": "system", 
-                "content": f"Relevant context from knowledge base:\n{context}"
-            })
+            prompt_parts.append(f"Context: {context}\n")
         
         # Add conversation history (last few turns for context)
-        for turn in history[-5:]:  # Include last 5 turns
-            if isinstance(turn, dict):
-                if "user" in turn:
-                    messages.append({"role": "user", "content": turn["user"]})
-                if "assistant" in turn:
-                    messages.append({"role": "assistant", "content": turn["assistant"]})
+        if history:
+            prompt_parts.append("Previous conversation:\n")
+            for turn in history[-3:]:  # Include last 3 turns
+                if isinstance(turn, dict):
+                    if "user" in turn:
+                        prompt_parts.append(f"User: {turn['user']}\n")
+                    if "assistant" in turn:
+                        prompt_parts.append(f"Assistant: {turn['assistant']}\n")
         
         # Add current user message
-        messages.append({"role": "user", "content": request.prompt})
+        prompt_parts.append(f"User: {request.prompt}\n")
+        prompt_parts.append("Assistant:")  # Prompt the model to respond
         
-        return messages
+        return "".join(prompt_parts)
     
     async def cleanup(self):
         if self.client:

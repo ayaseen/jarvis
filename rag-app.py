@@ -1,4 +1,4 @@
-# services/rag/app.py - COMPLETE PRODUCTION VERSION WITH LARGE DOCUMENT SUPPORT
+# services/rag/app.py - COMPLETE ROBUST VERSION
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -120,7 +120,7 @@ class MilvusManager:
                     logger.info(f"Loaded collection {collection_name} with {collection.num_entities} entities")
                     continue
                 
-                # Define schema for new collection
+                # Define schema for collection
                 fields = [
                     FieldSchema(
                         name="id",
@@ -377,20 +377,6 @@ class MilvusManager:
         except Exception as e:
             logger.error(f"Error getting collection stats: {e}")
             return {"error": str(e)}
-    
-    async def delete_collection(self, collection_name: str) -> bool:
-        """Delete a collection"""
-        try:
-            if utility.has_collection(collection_name):
-                utility.drop_collection(collection_name)
-                if collection_name in self.collections:
-                    del self.collections[collection_name]
-                logger.info(f"Deleted collection: {collection_name}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Error deleting collection: {e}")
-            return False
 
 class RAGEngine:
     def __init__(self):
@@ -459,15 +445,11 @@ class RAGEngine:
             if filename.lower().endswith('.pdf'):
                 with open(file_path, 'rb') as file:
                     pdf_reader = PyPDF2.PdfReader(file)
-                    logger.info(f"PDF has {len(pdf_reader.pages)} pages")
-                    
                     for page_num, page in enumerate(pdf_reader.pages):
                         try:
                             page_text = page.extract_text()
                             if page_text:
                                 text += page_text + "\n"
-                                if page_num < 3:  # Log first few pages
-                                    logger.info(f"Page {page_num} sample: {page_text[:100]}...")
                         except Exception as e:
                             logger.error(f"Error extracting page {page_num}: {e}")
             
@@ -502,36 +484,13 @@ class RAGEngine:
         text = text.strip()
         return text
     
-    def chunk_text(self, text: str, filename: str = "", chunk_size: int = 300, overlap: int = 50) -> List[str]:
-        """
-        Split text into overlapping chunks with adaptive sizing for different file types
-        
-        Args:
-            text: Text to chunk
-            filename: Original filename (used to determine chunking strategy)
-            chunk_size: Target chunk size in words
-            overlap: Number of words to overlap between chunks
-        
-        Returns:
-            List of text chunks
-        """
+    def chunk_text(self, text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]:
+        """Split text into overlapping chunks with improved chunking"""
         if not text:
             return []
         
         # Clean text first
         text = self.clean_text(text)
-        
-        # Adaptive chunk size based on file type
-        if filename.lower().endswith('.pdf'):
-            # PDFs often have dense text, use smaller chunks
-            chunk_size = min(chunk_size, 250)  # Max 250 words for PDFs
-            overlap = min(overlap, 30)
-        elif filename.lower().endswith(('.doc', '.docx')):
-            # Word docs are usually well-structured
-            chunk_size = min(chunk_size, 300)
-        else:
-            # Text files and others
-            chunk_size = min(chunk_size, 350)
         
         # Split by sentences for better context preservation
         sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -544,65 +503,36 @@ class RAGEngine:
             sentence_words = sentence.split()
             sentence_length = len(sentence_words)
             
-            # If single sentence is too long, split it
-            if sentence_length > chunk_size:
-                # Split long sentence into smaller parts
-                words = sentence.split()
-                for i in range(0, len(words), chunk_size - overlap):
-                    chunk_words = words[i:i + chunk_size]
-                    chunk_text = ' '.join(chunk_words)
-                    if len(chunk_text.strip()) > 20:  # Minimum chunk size
-                        chunks.append(chunk_text)
+            if current_length + sentence_length <= chunk_size:
+                current_chunk.append(sentence)
+                current_length += sentence_length
             else:
-                # Normal sentence processing
-                if current_length + sentence_length <= chunk_size:
-                    current_chunk.append(sentence)
-                    current_length += sentence_length
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    if len(chunk_text.strip()) > 10:
+                        chunks.append(chunk_text)
+                
+                # Start new chunk with overlap
+                if overlap > 0 and current_chunk:
+                    # Keep last few sentences for overlap
+                    overlap_sentences = current_chunk[-2:] if len(current_chunk) > 1 else current_chunk
+                    current_chunk = overlap_sentences + [sentence]
+                    current_length = sum(len(s.split()) for s in current_chunk)
                 else:
-                    # Save current chunk
-                    if current_chunk:
-                        chunk_text = ' '.join(current_chunk)
-                        if len(chunk_text.strip()) > 20:
-                            chunks.append(chunk_text)
-                    
-                    # Start new chunk with overlap
-                    if overlap > 0 and current_chunk:
-                        # Keep last few sentences for overlap
-                        overlap_sentences = []
-                        overlap_length = 0
-                        
-                        # Add sentences from the end until we reach overlap size
-                        for sent in reversed(current_chunk):
-                            sent_len = len(sent.split())
-                            if overlap_length + sent_len <= overlap:
-                                overlap_sentences.insert(0, sent)
-                                overlap_length += sent_len
-                            else:
-                                break
-                        
-                        current_chunk = overlap_sentences + [sentence]
-                        current_length = overlap_length + sentence_length
-                    else:
-                        current_chunk = [sentence]
-                        current_length = sentence_length
+                    current_chunk = [sentence]
+                    current_length = sentence_length
         
         # Add last chunk
         if current_chunk:
             chunk_text = ' '.join(current_chunk)
-            if len(chunk_text.strip()) > 20:
+            if len(chunk_text.strip()) > 10:
                 chunks.append(chunk_text)
         
-        # Log chunking statistics
-        logger.info(f"Created {len(chunks)} chunks from {filename}")
-        if chunks:
-            avg_size = sum(len(c.split()) for c in chunks) / len(chunks)
-            logger.info(f"Average chunk size: {avg_size:.1f} words")
-            logger.info(f"First chunk preview: {chunks[0][:100]}...")
-        
+        logger.info(f"Created {len(chunks)} chunks with size ~{chunk_size} words")
         return chunks
     
     async def ingest_document(self, file: UploadFile, collection: str = "documents") -> Dict[str, Any]:
-        """Ingest a document into Milvus with improved processing for large documents"""
+        """Ingest a document into Milvus with improved processing"""
         temp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
         
         try:
@@ -623,20 +553,9 @@ class RAGEngine:
             
             logger.info(f"Processing document: {file.filename} ({len(text)} characters)")
             
-            # Chunk text with filename awareness for better sizing
-            chunks = self.chunk_text(text, filename=file.filename, chunk_size=250, overlap=30)
-            
+            # Chunk text with smaller chunks for better precision
+            chunks = self.chunk_text(text, chunk_size=300, overlap=50)
             logger.info(f"Created {len(chunks)} chunks from {file.filename}")
-            
-            # For large PDFs, limit the number of chunks to avoid memory issues
-            max_chunks = 100
-            if len(chunks) > max_chunks:
-                logger.warning(f"Large document: {len(chunks)} chunks. Limiting to first {max_chunks} chunks.")
-                # Take chunks evenly distributed throughout the document
-                indices = np.linspace(0, len(chunks)-1, max_chunks, dtype=int)
-                selected_chunks = [chunks[i] for i in indices]
-                chunks = selected_chunks
-                logger.info(f"Selected {len(chunks)} representative chunks from document")
             
             # Log sample chunks for debugging
             if chunks:
@@ -646,26 +565,15 @@ class RAGEngine:
             
             # Generate embeddings with normalization
             embeddings = []
-            batch_size = 16  # Smaller batch size for large documents
-            
+            batch_size = 32
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i:i+batch_size]
-                try:
-                    batch_embeddings = self.embedder.encode(
-                        batch, 
-                        show_progress_bar=False,
-                        normalize_embeddings=True  # Normalize for cosine similarity
-                    )
-                    embeddings.extend(batch_embeddings.tolist())
-                    
-                    # Log progress for large documents
-                    if len(chunks) > 50 and (i % 32 == 0 or i == 0):
-                        logger.info(f"Embedding progress: {min(i+batch_size, len(chunks))}/{len(chunks)} chunks processed")
-                except Exception as e:
-                    logger.error(f"Error encoding batch {i//batch_size}: {e}")
-                    raise
-            
-            logger.info(f"Generated {len(embeddings)} embeddings")
+                batch_embeddings = self.embedder.encode(
+                    batch, 
+                    show_progress_bar=False,
+                    normalize_embeddings=True  # Normalize for cosine similarity
+                )
+                embeddings.extend(batch_embeddings.tolist())
             
             # Prepare metadata
             sources = [file.filename] * len(chunks)
@@ -674,9 +582,8 @@ class RAGEngine:
                 {
                     "filename": file.filename,
                     "total_chunks": len(chunks),
-                    "chunk_size": len(chunk.split()),  # Word count
+                    "chunk_size": len(chunk),
                     "file_hash": file_hash,
-                    "file_type": file.filename.split('.')[-1].lower(),
                     "ingested_at": datetime.utcnow().isoformat()
                 }
                 for chunk in chunks
@@ -714,8 +621,6 @@ class RAGEngine:
                 else:
                     logger.warning("Verification warning: Could not find ingested content in search")
             
-            avg_chunk_size = sum(len(c.split()) for c in chunks) / len(chunks) if chunks else 0
-            
             return {
                 "status": "success",
                 "filename": file.filename,
@@ -724,7 +629,6 @@ class RAGEngine:
                 "document_id": document_id,
                 "file_hash": file_hash,
                 "text_length": len(text),
-                "average_chunk_size": avg_chunk_size,
                 "sample_text": text[:200] + "..." if len(text) > 200 else text
             }
             
@@ -940,25 +844,6 @@ async def clear_collection(collection_name: str):
     except Exception as e:
         logger.error(f"Error clearing collection: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/collections/{collection_name}/stats")
-async def get_collection_stats(collection_name: str):
-    """Get statistics for a collection"""
-    if not engine:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    if not engine.milvus.connected:
-        await engine.connect()
-    
-    if not engine.milvus.connected:
-        raise HTTPException(status_code=503, detail="Milvus not connected")
-    
-    stats = await engine.milvus.get_collection_stats(collection_name)
-    
-    if "error" in stats:
-        raise HTTPException(status_code=404, detail=stats["error"])
-    
-    return stats
 
 @app.get("/collections/{collection_name}/sample")
 async def sample_collection(
