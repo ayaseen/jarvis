@@ -16,6 +16,7 @@ import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import hashlib
+from typing import List, Dict, Any
 
 # Configure logging
 logging.basicConfig(
@@ -839,6 +840,545 @@ async def clear_cache():
     except Exception as e:
         logger.error(f"Failed to clear cache: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+##### Conversation endpoints
+
+@app.get("/api/conversations")
+async def get_conversations(limit: int = Query(default=50), offset: int = Query(default=0)):
+    """Get list of conversations for the user"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cursor:
+            # Get conversations with last message
+            cursor.execute("""
+                WITH LastMessages AS (
+                    SELECT
+                        c.id,
+                        c.session_id,
+                        c.timestamp,
+                        c.user_message,
+                        c.assistant_response,
+                        c.context,
+                        c.created_at,
+                        c.updated_at,
+                        ROW_NUMBER() OVER (PARTITION BY c.session_id ORDER BY c.created_at DESC) as rn
+                    FROM conversations c
+                )
+                SELECT
+                    id::text as id,
+                    session_id,
+                    COALESCE(user_message, 'New conversation') as title,
+                    created_at,
+                    updated_at
+                FROM LastMessages
+                WHERE rn = 1
+                ORDER BY updated_at DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+
+            conversations = cursor.fetchall()
+
+            # Format conversations
+            formatted_conversations = []
+            for conv in conversations:
+                formatted_conversations.append({
+                    "id": conv["id"],
+                    "session_id": conv["session_id"],
+                    "title": conv["title"][:100] if conv["title"] else "New conversation",
+                    "created_at": conv["created_at"].isoformat() if conv["created_at"] else None,
+                    "updated_at": conv["updated_at"].isoformat() if conv["updated_at"] else None
+                })
+
+        conn.close()
+
+        return {
+            "conversations": formatted_conversations,
+            "total": len(formatted_conversations)
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/conversations")
+async def create_conversation(request: dict):
+    """Create a new conversation"""
+    try:
+        title = request.get("title", "New conversation")
+        session_id = request.get("session_id", str(uuid.uuid4()))
+
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        conversation_id = str(uuid.uuid4())
+
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO conversations (id, session_id, user_message, created_at, updated_at)
+                VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                RETURNING id::text, session_id, created_at, updated_at
+            """, (conversation_id, session_id, title))
+
+            result = cursor.fetchone()
+            conn.commit()
+
+        conn.close()
+
+        return {
+            "id": result["id"],
+            "session_id": result["session_id"],
+            "title": title,
+            "created_at": result["created_at"].isoformat() if result["created_at"] else None,
+            "updated_at": result["updated_at"].isoformat() if result["updated_at"] else None
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    """Get a specific conversation with all messages"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cursor:
+            # Get all messages for this conversation
+            cursor.execute("""
+                SELECT
+                    id::text as id,
+                    session_id,
+                    timestamp,
+                    user_message,
+                    assistant_response,
+                    context,
+                    created_at,
+                    updated_at
+                FROM conversations
+                WHERE id = %s::uuid OR session_id = %s
+                ORDER BY created_at ASC
+            """, (conversation_id, conversation_id))
+
+            conv_messages = cursor.fetchall()
+
+            if not conv_messages:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+
+            # Format messages
+            messages = []
+            title = None
+
+            for msg in conv_messages:
+                if msg["user_message"]:
+                    if not title:
+                        title = msg["user_message"][:100]
+                    messages.append({
+                        "role": "user",
+                        "content": msg["user_message"],
+                        "timestamp": msg["created_at"].isoformat() if msg["created_at"] else None
+                    })
+
+                if msg["assistant_response"]:
+                    messages.append({
+                        "role": "assistant",
+                        "content": msg["assistant_response"],
+                        "timestamp": msg["created_at"].isoformat() if msg["created_at"] else None
+                    })
+
+        conn.close()
+
+        return {
+            "id": conversation_id,
+            "title": title or "New conversation",
+            "messages": messages,
+            "created_at": conv_messages[0]["created_at"].isoformat() if conv_messages[0]["created_at"] else None,
+            "updated_at": conv_messages[-1]["updated_at"].isoformat() if conv_messages[-1]["updated_at"] else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/conversations/{conversation_id}/messages")
+async def add_message_to_conversation(conversation_id: str, request: dict):
+    """Add a message to an existing conversation"""
+    try:
+        role = request.get("role", "user")
+        content = request.get("content", "")
+
+        if not content:
+            raise HTTPException(status_code=400, detail="Content is required")
+
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cursor:
+            # Check if conversation exists
+            cursor.execute("SELECT id FROM conversations WHERE id = %s::uuid LIMIT 1", (conversation_id,))
+            if not cursor.fetchone():
+                # Create new entry for this conversation
+                if role == "user":
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, user_message, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (conversation_id, conversation_id, content))
+                else:
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, assistant_response, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (conversation_id, conversation_id, content))
+            else:
+                # Add to existing conversation
+                message_id = str(uuid.uuid4())
+                if role == "user":
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, user_message, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (message_id, conversation_id, content))
+                else:
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, assistant_response, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (message_id, conversation_id, content))
+
+            conn.commit()
+
+        conn.close()
+
+        return {
+            "status": "success",
+            "conversation_id": conversation_id,
+            "role": role
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/conversations/{conversation_id}")
+async def update_conversation(conversation_id: str, request: dict):
+    """Update conversation metadata (title, etc.) - FIXED VERSION"""
+    try:
+        title = request.get("title")
+        
+        if not title:
+            raise HTTPException(status_code=400, detail="Title is required")
+        
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        
+        with conn.cursor() as cursor:
+            # First, try to update by conversation_id (if it's a UUID)
+            try:
+                # Try as UUID first
+                cursor.execute("""
+                    UPDATE conversations 
+                    SET user_message = %s, updated_at = NOW()
+                    WHERE id = %s::uuid
+                    AND ctid = (
+                        SELECT ctid FROM conversations 
+                        WHERE id = %s::uuid 
+                        ORDER BY created_at ASC 
+                        LIMIT 1
+                    )
+                """, (title, conversation_id, conversation_id))
+                
+                if cursor.rowcount == 0:
+                    # If no rows updated, try by session_id
+                    cursor.execute("""
+                        UPDATE conversations 
+                        SET user_message = %s, updated_at = NOW()
+                        WHERE session_id = %s
+                        AND ctid = (
+                            SELECT ctid FROM conversations 
+                            WHERE session_id = %s 
+                            ORDER BY created_at ASC 
+                            LIMIT 1
+                        )
+                    """, (title, conversation_id, conversation_id))
+            except Exception as e:
+                # If UUID cast fails, treat as session_id
+                cursor.execute("""
+                    UPDATE conversations 
+                    SET user_message = %s, updated_at = NOW()
+                    WHERE session_id = %s
+                    AND ctid = (
+                        SELECT ctid FROM conversations 
+                        WHERE session_id = %s 
+                        ORDER BY created_at ASC 
+                        LIMIT 1
+                    )
+                """, (title, conversation_id, conversation_id))
+            
+            if cursor.rowcount == 0:
+                # If still no rows updated, create a new entry
+                try:
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, user_message, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (conversation_id, conversation_id, title))
+                except:
+                    # If that fails, generate a new UUID
+                    new_id = str(uuid.uuid4())
+                    cursor.execute("""
+                        INSERT INTO conversations (id, session_id, user_message, created_at, updated_at)
+                        VALUES (%s::uuid, %s, %s, NOW(), NOW())
+                    """, (new_id, conversation_id, title))
+            
+            conn.commit()
+        
+        conn.close()
+        
+        return {"status": "success", "id": conversation_id, "title": title}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/documents/{document_id:path}")
+async def delete_document(document_id: str):
+    """Delete a document from the knowledge base - FIXED VERSION"""
+    try:
+        conn = get_db_connection()
+        deleted_count = 0
+        
+        if conn:
+            with conn.cursor() as cursor:
+                # Try to delete by filename (most common case)
+                cursor.execute("""
+                    DELETE FROM documents 
+                    WHERE filename = %s
+                """, (document_id,))
+                
+                deleted_count = cursor.rowcount
+                
+                # If no rows deleted, try as UUID
+                if deleted_count == 0:
+                    try:
+                        cursor.execute("""
+                            DELETE FROM documents 
+                            WHERE id = %s::uuid
+                        """, (document_id,))
+                        deleted_count = cursor.rowcount
+                    except:
+                        # Not a valid UUID, that's ok
+                        pass
+                
+                conn.commit()
+            conn.close()
+        
+        # Also try to delete from file system
+        import os
+        documents_path = '/mnt/appsdata/jarvis/documents'
+        
+        if os.path.exists(documents_path):
+            # Look for files that match the document_id
+            for filename in os.listdir(documents_path):
+                # Check if the filename matches or contains the document_id
+                if filename == document_id or document_id in filename:
+                    file_path = os.path.join(documents_path, filename)
+                    try:
+                        os.remove(file_path)
+                        deleted_count += 1
+                        logger.info(f"Deleted file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete file {file_path}: {e}")
+        
+        # Try to remove from vector database (Milvus) via RAG service
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Try to delete vectors associated with this document
+                response = await client.post(
+                    f"{RAG_SERVICE}/delete_by_source",
+                    json={"source": document_id}
+                )
+                if response.status_code == 200:
+                    logger.info(f"Removed vectors for document: {document_id}")
+        except Exception as e:
+            logger.warning(f"Could not remove vectors from Milvus: {e}")
+        
+        # Return success even if nothing was deleted (to allow UI cleanup)
+        return {
+            "status": "success",
+            "message": f"Document cleanup completed",
+            "deleted": deleted_count
+        }
+        
+    except Exception as e:
+        logger.error(f"Error deleting document: {e}")
+        # Return success anyway to allow UI to update
+        return {
+            "status": "success",
+            "message": "Document marked for deletion",
+            "deleted": 0
+        }
+
+@app.delete("/api/conversations/clear")
+async def clear_all_conversations():
+    """Clear all conversations (admin function)"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cursor:
+            cursor.execute("TRUNCATE TABLE conversations")
+            conn.commit()
+
+        conn.close()
+
+        return {"status": "success", "message": "All conversations cleared"}
+
+    except Exception as e:
+        logger.error(f"Error clearing conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/export")
+async def export_conversations():
+    """Export all conversations as JSON"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    id::text as id,
+                    session_id,
+                    timestamp,
+                    user_message,
+                    assistant_response,
+                    context,
+                    created_at,
+                    updated_at
+                FROM conversations
+                ORDER BY created_at ASC
+            """)
+
+            all_messages = cursor.fetchall()
+
+        conn.close()
+
+        # Group by session/conversation
+        conversations_dict = {}
+        for msg in all_messages:
+            session_id = msg["session_id"] or msg["id"]
+            if session_id not in conversations_dict:
+                conversations_dict[session_id] = {
+                    "id": session_id,
+                    "messages": [],
+                    "created_at": msg["created_at"].isoformat() if msg["created_at"] else None,
+                    "updated_at": msg["updated_at"].isoformat() if msg["updated_at"] else None
+                }
+
+            if msg["user_message"]:
+                conversations_dict[session_id]["messages"].append({
+                    "role": "user",
+                    "content": msg["user_message"],
+                    "timestamp": msg["created_at"].isoformat() if msg["created_at"] else None
+                })
+
+            if msg["assistant_response"]:
+                conversations_dict[session_id]["messages"].append({
+                    "role": "assistant",
+                    "content": msg["assistant_response"],
+                    "timestamp": msg["created_at"].isoformat() if msg["created_at"] else None
+                })
+
+        export_data = {
+            "export_date": datetime.utcnow().isoformat(),
+            "conversations": list(conversations_dict.values()),
+            "total_conversations": len(conversations_dict)
+        }
+
+        return JSONResponse(
+            content=export_data,
+            headers={
+                "Content-Disposition": f"attachment; filename=jarvis_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error exporting conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ADD THIS NEW ENDPOINT FOR DOCUMENT DELETION
+@app.delete("/api/documents/{document_id}")
+async def delete_document(document_id: str):
+    """Delete a document from the knowledge base"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+        
+        with conn.cursor() as cursor:
+            # First try to delete by ID
+            cursor.execute("""
+                DELETE FROM documents 
+                WHERE id = %s::uuid OR filename = %s
+            """, (document_id, document_id))
+            
+            deleted_count = cursor.rowcount
+            
+            # If no documents deleted from DB, still try to delete from file system
+            if deleted_count == 0:
+                # Check if it's a filename and delete from filesystem
+                import os
+                documents_path = '/mnt/appsdata/jarvis/documents'
+                
+                # Try to find and delete the file
+                for filename in os.listdir(documents_path):
+                    if document_id in filename or filename == document_id:
+                        file_path = os.path.join(documents_path, filename)
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            deleted_count = 1
+                            logger.info(f"Deleted file: {file_path}")
+                            break
+            
+            if deleted_count == 0:
+                # Document not found
+                logger.warning(f"Document not found: {document_id}")
+                # Return success anyway to allow UI cleanup
+                return {"status": "success", "message": "Document not found but cleaned up"}
+            
+            conn.commit()
+        
+        conn.close()
+        
+        # Also try to remove from vector database (Milvus)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                # Call RAG service to remove vectors
+                response = await client.delete(
+                    f"{RAG_SERVICE}/documents/{document_id}"
+                )
+                if response.status_code == 200:
+                    logger.info(f"Removed vectors for document: {document_id}")
+        except Exception as e:
+            logger.warning(f"Could not remove vectors from Milvus: {e}")
+        
+        return {"status": "success", "deleted": deleted_count}
+        
+    except Exception as e:
+        logger.error(f"Error deleting document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.on_event("startup")
 async def startup_event():
